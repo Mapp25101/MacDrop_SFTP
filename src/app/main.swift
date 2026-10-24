@@ -1,16 +1,16 @@
-// SFTP Drive (MacDrop SFTP) – aplikace v horní liště macOS.
+// SFTP Drive (MacDrop SFTP) – the macOS menu-bar app.
 //
-// Veškerou práci (synchronizace přes rclone, hesla v Klíčence, služby na pozadí) dělá
-// skript `sftpdrive`, který je přibalený v aplikaci a při prvním spuštění se nainstaluje
-// do ~/.local/bin. Tahle aplikace je jen grafické rozhraní nad ním:
+// All the real work (synchronisation via rclone, passwords in the Keychain, background
+// services) is done by the `sftpdrive` script that is bundled inside the app and installed
+// to ~/.local/bin on first launch. This app is only the graphical front end for it:
 //
-//   • AppDelegate        ikonka v liště, menu se stavem serverů, samooprava (služby,
-//                        které nikdo nepozastavil, spustí znovu), první spuštění
-//   • AddServerWindow    okno „Přidat server“ (SFTP / FTP / FTPS, ověření klíče serveru)
-//   • FolderChooser      okno „Vybrat synchronizované složky“
-//   • odkazy sftpdrive://  akce z menu pravého tlačítka ve Finderu (finder.swift)
+//   • AppDelegate        menu-bar icon, menu with the state of each server, self-healing
+//                        (restarts services nobody paused), first-run setup
+//   • AddServerWindow    the "Add server" window (SFTP / FTP / FTPS, host-key check)
+//   • FolderChooser      the "Choose synchronised folders" window
+//   • sftpdrive:// links actions from the Finder context menu (finder.swift)
 //
-// Stav čte příkazem `sftpdrive _info` (jeden řádek na server, pole oddělená tabulátorem).
+// State is read with `sftpdrive _info` (one line per server, tab-separated fields).
 
 import AppKit
 
@@ -27,14 +27,14 @@ let toolPath = home + "/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bi
 
 var bundledScript: String? { Bundle.main.path(forResource: "sftpdrive", ofType: nil) }
 
-// MARK: - Spouštění skriptu
+// MARK: - Running the script
 
 struct RunResult {
     let code: Int32
     let out: String
     var ok: Bool { code == 0 }
 
-    /// Srozumitelná chybová hláška (řádky "✖ …" ze skriptu, jinak konec výstupu).
+    /// A readable error message ("✖ …" lines from the script, otherwise the tail of the output).
     var errorText: String {
         let clean = out.replacingOccurrences(of: "\u{1B}\\[[0-9;]*m", with: "", options: .regularExpression)
         let lines = clean.split(separator: "\n").map { String($0) }
@@ -74,7 +74,7 @@ func runAsync(_ args: [String], stdin: String? = nil, script: String = installed
 
 let finderExtID = "cz.sftpdrive.app.finder"
 
-/// Běží proces ze souborů, které se mezitím změnily (aplikace byla nahrazena novou verzí)?
+/// Is the process running from files that have changed since it started (app replaced by a new version)?
 func isStale(_ app: NSRunningApplication) -> Bool {
     guard let exe = app.executableURL?.path,
           let modified = (try? FileManager.default.attributesOfItem(atPath: exe))?[.modificationDate] as? Date,
@@ -82,7 +82,7 @@ func isStale(_ app: NSRunningApplication) -> Bool {
     return modified > started
 }
 
-/// Čas spuštění procesu (z jádra – funguje i u procesů spuštěných přes launchd).
+/// Process start time (from the kernel – also works for processes started by launchd).
 func processStart(_ pid: pid_t) -> Date? {
     var info = kinfo_proc()
     var size = MemoryLayout<kinfo_proc>.stride
@@ -92,7 +92,7 @@ func processStart(_ pid: pid_t) -> Date? {
     return Date(timeIntervalSince1970: Double(t.tv_sec) + Double(t.tv_usec) / 1_000_000)
 }
 
-/// Spustí nástroj a počká na výsledek (výstup).
+/// Runs a tool and waits for its output.
 func runTool(_ cmd: String, _ args: [String]) -> String {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: cmd)
@@ -106,7 +106,7 @@ func runTool(_ cmd: String, _ args: [String]) -> String {
     return String(decoding: d, as: UTF8.self)
 }
 
-/// Je rozšíření Finderu zapnuté? (pluginkit vypíše „+“ na začátku řádku)
+/// Is the Finder extension enabled? (pluginkit prints "+" at the start of the line)
 func finderExtEnabled() -> Bool {
     runTool("/usr/bin/pluginkit", ["-m", "-i", finderExtID]).trimmingCharacters(in: .whitespaces).hasPrefix("+")
 }
@@ -128,9 +128,9 @@ struct Conn {
     let mountDir, offlineDir: String
     let mounted, running, syncing: Bool
     let state, time, message: String
-    let pending: Int          // souborů čekajících na nahrání
-    let label: String         // název složky ve Finderu
-    let paused: Bool          // ručně pozastaveno (jinak se po startu Macu spouští samo)
+    let pending: Int          // files waiting to be uploaded
+    let label: String         // folder name in Finder
+    let paused: Bool          // paused by hand (otherwise it starts by itself after boot)
 
     init?(line: String) {
         let f = line.components(separatedBy: "\t")
@@ -155,14 +155,14 @@ struct Conn {
     }
 
     var statusText: String {
-        if !running { return paused ? "Pozastaveno" : "Spouštím synchronizaci…" }
-        if syncing { return "Synchronizuji…" }
+        if !running { return paused ? "Paused" : "Starting sync…" }
+        if syncing { return "Syncing…" }
         let t = time.split(separator: " ").last.map { String($0.prefix(5)) } ?? ""
         switch state {
-        case "ok": return "Synchronizováno \(t)"
-        case "offline": return pending > 0 ? "Bez připojení – \(pending) čeká na nahrání" : "Server nedostupný – offline"
-        case "error": return pending > 0 ? "Chyba – \(pending) čeká na nahrání" : "Chyba synchronizace"
-        default: return "Spouštím…"
+        case "ok": return "Synced \(t)"
+        case "offline": return pending > 0 ? "No connection – \(pending) waiting to upload" : "Server unreachable – offline"
+        case "error": return pending > 0 ? "Error – \(pending) waiting to upload" : "Sync error"
+        default: return "Starting…"
         }
     }
 
@@ -183,7 +183,7 @@ func sfSymbol(_ name: String, _ desc: String = "") -> NSImage? {
     return img
 }
 
-// MARK: - Pomůcky pro dialogy
+// MARK: - Dialog helpers
 
 @discardableResult
 func alert(_ title: String, _ text: String, buttons: [String] = ["OK"],
@@ -212,7 +212,7 @@ func hint(_ s: String) -> NSTextField {
     return l
 }
 
-// MARK: - Okno "Přidat server"
+// MARK: - "Add server" window
 
 final class AddServerWindow: NSWindowController, NSWindowDelegate {
     var onDone: ((_ label: String, _ choose: Bool) -> Void)?
@@ -228,11 +228,11 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
     let path = NSTextField()
     let name = NSTextField()
     let syncPopup = NSPopUpButton()
-    let certBox = NSButton(checkboxWithTitle: "Nekontrolovat certifikát (vlastní / self-signed)", target: nil, action: nil)
+    let certBox = NSButton(checkboxWithTitle: "Do not verify the certificate (self-signed / private CA)", target: nil, action: nil)
     let spinner = NSProgressIndicator()
     let status = NSTextField(labelWithString: "")
-    let connectButton = NSButton(title: "Připojit", target: nil, action: nil)
-    let cancelButton = NSButton(title: "Zrušit", target: nil, action: nil)
+    let connectButton = NSButton(title: "Connect", target: nil, action: nil)
+    let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
     var grid: NSGridView!
     var nameEdited = false
     var lastDefaultPort = "22"
@@ -240,27 +240,27 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
     convenience init() {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 480),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        w.title = "SFTP Drive – přidat server"
+        w.title = "SFTP Drive – add server"
         self.init(window: w)
         w.delegate = self
         build()
     }
 
     func build() {
-        proto.addItems(withTitles: ["SFTP (přes SSH)", "FTP", "FTPS (FTP se šifrováním)"])
+        proto.addItems(withTitles: ["SFTP (over SSH)", "FTP", "FTPS (FTP with TLS)"])
         proto.target = self; proto.action = #selector(protoChanged)
-        authPopup.addItems(withTitles: ["Heslo", "SSH klíč"])
+        authPopup.addItems(withTitles: ["Password", "SSH key"])
         authPopup.target = self; authPopup.action = #selector(authChanged)
-        host.placeholderString = "např. muj-server.cz nebo 192.168.1.10"
+        host.placeholderString = "e.g. my-server.com or 192.168.1.10"
         port.stringValue = "22"
-        user.placeholderString = "uživatelské jméno"
-        pass.placeholderString = "heslo (uloží se do Klíčenky)"
+        user.placeholderString = "user name"
+        pass.placeholderString = "password (stored in the Keychain)"
         keyPath.stringValue = ["id_ed25519", "id_rsa", "id_ecdsa"].map { home + "/.ssh/" + $0 }
             .first { FileManager.default.fileExists(atPath: $0) } ?? home + "/.ssh/id_ed25519"
         keyButton.target = self; keyButton.action = #selector(pickKey)
-        path.placeholderString = "prázdné = domovská složka, např. /var/www"
-        name.placeholderString = "např. Škola"
-        syncPopup.addItems(withTitles: ["Celý server (doporučeno)", "Jen vybrané složky – vyberu po připojení"])
+        path.placeholderString = "empty = home folder, e.g. /var/www"
+        name.placeholderString = "e.g. School"
+        syncPopup.addItems(withTitles: ["Whole server (recommended)", "Only selected folders – I will choose after connecting"])
         host.target = self; host.action = nil
         NotificationCenter.default.addObserver(self, selector: #selector(hostChanged),
                                                name: NSControl.textDidChangeNotification, object: host)
@@ -274,20 +274,20 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
         status.lineBreakMode = .byTruncatingTail
 
         let keyRow = NSStackView(views: [keyPath, keyButton])
-        let portRow = NSStackView(views: [port, hint("SFTP obvykle 22, FTP/FTPS 21")])
+        let portRow = NSStackView(views: [port, hint("SFTP usually 22, FTP/FTPS 21")])
 
         grid = NSGridView(views: [
-            [label("Protokol:"), proto],
+            [label("Protocol:"), proto],
             [label("Server:"), host],
             [label("Port:"), portRow],
-            [label("Uživatel:"), user],
-            [label("Přihlášení:"), authPopup],
-            [label("Heslo:"), pass],
-            [label("SSH klíč:"), keyRow],
-            [label("Složka na serveru:"), path],
-            [label("Název složky:"), name],
-            [NSGridCell.emptyContentView, hint("Ve Finderu bude složka „SFTP Drive → <název>“. Je to obyčejná složka na disku – funguje i bez internetu.")],
-            [label("Synchronizovat:"), syncPopup],
+            [label("User:"), user],
+            [label("Login:"), authPopup],
+            [label("Password:"), pass],
+            [label("SSH key:"), keyRow],
+            [label("Server folder:"), path],
+            [label("Folder name:"), name],
+            [NSGridCell.emptyContentView, hint("In Finder you get the folder “SFTP Drive → <name>”. It is a plain folder on your disk – it works offline too.")],
+            [label("Sync:"), syncPopup],
             [NSGridCell.emptyContentView, certBox],
         ])
         grid.column(at: 0).xPlacement = .trailing
@@ -304,7 +304,7 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
         buttons.distribution = .fill
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let intro = hint("Zadej údaje k serveru. Po připojení bude server ve Finderu jako složka ve „SFTP Drive“ a ikonka v horní liště ukáže stav synchronizace.")
+        let intro = hint("Enter the server details. After connecting, the server appears in Finder as a folder inside “SFTP Drive” and the menu-bar icon shows the sync status.")
         let stack = NSStackView(views: [intro, grid, buttons])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -335,8 +335,8 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
     @objc func authChanged() {
         let key = protoKey == "sftp" && authPopup.indexOfSelectedItem == 1
         setRow(6, hidden: !key)
-        (grid.cell(atColumnIndex: 0, rowIndex: 5).contentView as? NSTextField)?.stringValue = key ? "Heslo ke klíči:" : "Heslo:"
-        pass.placeholderString = key ? "passphrase klíče (když žádnou nemá, nech prázdné)" : "heslo (uloží se do Klíčenky)"
+        (grid.cell(atColumnIndex: 0, rowIndex: 5).contentView as? NSTextField)?.stringValue = key ? "Key passphrase:" : "Password:"
+        pass.placeholderString = key ? "key passphrase (leave empty if it has none)" : "password (stored in the Keychain)"
     }
 
     @objc func pickKey() {
@@ -351,7 +351,7 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
         var h = host.stringValue
         if let r = h.range(of: "://") { h = String(h[r.upperBound...]) }
         h = String(h.split(whereSeparator: { $0 == "/" || $0 == ":" }).first ?? "")
-        // ftp.example.com → „Example“ (doména bez ftp./www. a koncovky); IP adresa → „Server“
+        // ftp.example.com → "Example" (domain without ftp./www. and the TLD); IP address → "Server"
         let parts = h.split(separator: ".").map(String.init)
         let isIP = !parts.isEmpty && parts.allSatisfy { Int($0) != nil }
         let guess = isIP || parts.isEmpty ? "" : (parts.count >= 2 ? parts[parts.count - 2] : parts[0])
@@ -374,23 +374,23 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
         let u = user.stringValue.trimmingCharacters(in: .whitespaces)
         let n = name.stringValue.trimmingCharacters(in: .whitespaces)
         let useKey = protoKey == "sftp" && authPopup.indexOfSelectedItem == 1
-        if h.isEmpty { return fail("Vyplň adresu serveru.") }
-        if u.isEmpty { return fail("Vyplň uživatelské jméno.") }
-        if !useKey && pass.stringValue.isEmpty { return fail("Vyplň heslo.") }
-        if Int(port.stringValue) == nil { return fail("Port musí být číslo.") }
+        if h.isEmpty { return fail("Enter the server address.") }
+        if u.isEmpty { return fail("Enter the user name.") }
+        if !useKey && pass.stringValue.isEmpty { return fail("Enter the password.") }
+        if Int(port.stringValue) == nil { return fail("The port must be a number.") }
         if n.isEmpty || n.contains("/") || n.hasPrefix(".") {
-            return fail("Vyplň název složky (bez „/“ a nesmí začínat tečkou).")
+            return fail("Enter a folder name (no “/”, must not start with a dot).")
         }
         if protoKey == "sftp" {
-            busy(true, "Ověřuji server…")
+            busy(true, "Checking the server…")
             let hostOnly = hostPart(h)
             runAsync(["_keyscan", hostOnly, port.stringValue]) { r in
                 guard r.ok else { self.busy(false); return self.fail(r.errorText) }
                 let fps = r.out.split(separator: "\n").map(String.init).filter { $0.hasPrefix("SHA256:") }
-                guard let first = fps.first else { self.busy(false); return self.fail("Server nevrátil klíč.") }
-                let choice = alert("Je to opravdu tvůj server?",
-                                   "Otisk klíče serveru \(hostOnly):\n\n\(fps.joined(separator: "\n"))\n\nPři prvním připojení obvykle stačí potvrdit. Příště se klíč kontroluje automaticky – když by se změnil, připojení se odmítne.",
-                                   buttons: ["Důvěřovat a připojit", "Zrušit"])
+                guard let first = fps.first else { self.busy(false); return self.fail("The server did not return a key.") }
+                let choice = alert("Is this really your server?",
+                                   "Key fingerprint of \(hostOnly):\n\n\(fps.joined(separator: "\n"))\n\nOn the first connection you normally just confirm. From now on the key is checked automatically – if it ever changes, the connection is refused.",
+                                   buttons: ["Trust and connect", "Cancel"])
                 if choice != 0 { self.busy(false); return }
                 self.runSetup(expectFp: String(first.split(separator: " ")[0]))
             }
@@ -408,7 +408,7 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
     }
 
     func runSetup(expectFp: String?) {
-        busy(true, "Připojuji a nastavuji… (může chvíli trvat)")
+        busy(true, "Connecting and setting up… (may take a moment)")
         let n = name.stringValue.trimmingCharacters(in: .whitespaces)
         let choose = syncPopup.indexOfSelectedItem == 1
         var args = ["setup", "--yes", "--proto", protoKey, "--label", n,
@@ -428,16 +428,16 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
             self.close()
             decorateDriveRoot()
             self.onDone?(n, choose)
-            if choose { return }   // rovnou se otevře výběr složek
-            let text = "Server je ve Finderu jako složka „\(n)“ ve složce SFTP Drive. Stahuje se a dál se synchronizuje oběma směry – funguje i bez internetu.\n\nTip: vyber ve Finderu složku „SFTP Drive“ a stiskni ⌃⌘T (Soubor → Přidat do postranního panelu)."
-            if alert("Připojeno ✓", text, buttons: ["Otevřít ve Finderu", "Hotovo"]) == 0 {
+            if choose { return }   // the folder chooser opens right away
+            let text = "The server is in Finder as the folder “\(n)” inside SFTP Drive. It is downloading and will keep syncing both ways – it works offline too.\n\nTip: select the “SFTP Drive” folder in Finder and press ⌃⌘T (File → Add to Sidebar)."
+            if alert("Connected ✓", text, buttons: ["Open in Finder", "Done"]) == 0 {
                 NSWorkspace.shared.open(URL(fileURLWithPath: driveRoot + "/" + n))
             }
         }
     }
 
     func fail(_ msg: String) {
-        alert("Nepodařilo se připojit", msg, style: .warning)
+        alert("Could not connect", msg, style: .warning)
     }
 
     func show() {
@@ -449,9 +449,9 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
     }
 }
 
-// MARK: - Okno "Vybrat synchronizované složky"
+// MARK: - "Choose synchronised folders" window
 
-/// Stejná logika jako ve skriptu: rozhoduje nejkonkrétnější pravidlo.
+/// Same logic as in the script: the most specific rule wins.
 func isPinned(_ rules: [Rule], _ rel: String) -> Bool {
     var best: Bool? = nil, bestLen = -1
     for r in rules where r.path == "/" || rel == r.path || rel.hasPrefix(r.path + "/") {
@@ -467,18 +467,18 @@ final class FolderChooser: NSWindowController, NSWindowDelegate {
     let conn: Conn
     var onDone: (() -> Void)?
     var boxes: [(name: String, box: NSButton)] = []
-    let allBox = NSButton(checkboxWithTitle: "Celý server (i to, co na něm později přibude)", target: nil, action: nil)
+    let allBox = NSButton(checkboxWithTitle: "Whole server (including whatever is added later)", target: nil, action: nil)
     let list = NSStackView()
     let spinner = NSProgressIndicator()
-    let status = NSTextField(labelWithString: "Načítám obsah serveru…")
-    let saveButton = NSButton(title: "Uložit", target: nil, action: nil)
-    let cancelButton = NSButton(title: "Zrušit", target: nil, action: nil)
+    let status = NSTextField(labelWithString: "Loading the server contents…")
+    let saveButton = NSButton(title: "Save", target: nil, action: nil)
+    let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
 
     init(conn: Conn) {
         self.conn = conn
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 460),
                          styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-        w.title = "Synchronizované složky – \(conn.label)"
+        w.title = "Synchronised folders – \(conn.label)"
         super.init(window: w)
         w.delegate = self
         build()
@@ -487,7 +487,7 @@ final class FolderChooser: NSWindowController, NSWindowDelegate {
     required init?(coder: NSCoder) { fatalError() }
 
     func build() {
-        let intro = hint("Zaškrtnuté složky a soubory se stáhnou do složky „\(conn.label)“ a budou se synchronizovat. Co odškrtneš, smaže se jen z tohoto Macu – na serveru zůstane.")
+        let intro = hint("Checked folders and files are downloaded into the folder “\(conn.label)” and kept in sync. Whatever you uncheck is removed from this Mac only – it stays on the server.")
         allBox.target = self; allBox.action = #selector(allToggled)
         list.orientation = .vertical
         list.alignment = .leading
@@ -536,7 +536,7 @@ final class FolderChooser: NSWindowController, NSWindowDelegate {
         runAsync(["_ls", conn.name]) { r in
             self.spinner.stopAnimation(nil)
             guard r.ok else {
-                self.status.stringValue = "Server je nedostupný – zkus to, až budeš online."
+                self.status.stringValue = "The server is unreachable – try again when you are online."
                 return
             }
             let rules = self.conn.rules
@@ -546,13 +546,13 @@ final class FolderChooser: NSWindowController, NSWindowDelegate {
             for n in names {
                 let isDir = n.hasSuffix("/")
                 let clean = isDir ? String(n.dropLast()) : n
-                // ikonka v textu – obrázek u zaškrtávacího políčka by nahradil samotné políčko
+                // the icon is part of the title – an image on a checkbox would replace the checkbox itself
                 let box = NSButton(checkboxWithTitle: (isDir ? "📁  " : "📄  ") + clean, target: nil, action: nil)
                 box.state = isPinned(rules, "/" + clean.precomposedStringWithCanonicalMapping) ? .on : .off
                 self.list.addArrangedSubview(box)
                 self.boxes.append((clean, box))
             }
-            self.status.stringValue = names.isEmpty ? "Na serveru zatím nic není." : "Položek na serveru: \(names.count)"
+            self.status.stringValue = names.isEmpty ? "Nothing on the server yet." : "Items on the server: \(names.count)"
             self.saveButton.isEnabled = true
             self.allToggled()
         }
@@ -569,18 +569,18 @@ final class FolderChooser: NSWindowController, NSWindowDelegate {
         let all = allBox.state == .on
         let chosen = boxes.filter { $0.box.state == .on }.map { $0.name }
         if !all && chosen.isEmpty {
-            alert("Nic není vybráno", "Zaškrtni aspoň jednu složku, nebo „Celý server“.")
+            alert("Nothing selected", "Check at least one folder, or “Whole server”.")
             return
         }
         saveButton.isEnabled = false
         spinner.startAnimation(nil)
-        status.stringValue = "Ukládám a synchronizuji…"
+        status.stringValue = "Saving and synchronising…"
         runAsync(["_select", conn.name] + (all ? ["--all"] : chosen)) { r in
             self.spinner.stopAnimation(nil)
             self.saveButton.isEnabled = true
             guard r.ok else {
                 self.status.stringValue = ""
-                alert("Výběr se nepodařilo uložit", r.errorText, style: .warning)
+                alert("Could not save the selection", r.errorText, style: .warning)
                 return
             }
             self.close()
@@ -596,14 +596,14 @@ final class FolderChooser: NSWindowController, NSWindowDelegate {
     }
 }
 
-/// Složka ~/SFTP Drive dostane ikonu obláčku, ať je ve Finderu hned vidět.
+/// The ~/SFTP Drive folder gets a cloud icon so it stands out in Finder.
 func decorateDriveRoot() {
     guard FileManager.default.fileExists(atPath: driveRoot),
-          !FileManager.default.fileExists(atPath: driveRoot + "/Icon\r") else { return }   // už ikonu má
+          !FileManager.default.fileExists(atPath: driveRoot + "/Icon\r") else { return }   // already has the icon
     let size = NSSize(width: 512, height: 512)
     let folder = NSWorkspace.shared.icon(for: .folder)
     folder.size = size
-    // skutečná bitmapa 512×512 – z obrázku kresleného „za běhu“ macOS ikonu neumí uložit
+    // a real 512×512 bitmap – macOS cannot store an icon from an image drawn on the fly
     guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 512, pixelsHigh: 512, bitsPerSample: 8,
                                      samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
                                      bytesPerRow: 0, bitsPerPixel: 0) else { return }
@@ -627,7 +627,7 @@ func decorateDriveRoot() {
     NSWorkspace.shared.setIcon(img, forFile: driveRoot, options: [])
 }
 
-// MARK: - Aplikace (ikonka v liště)
+// MARK: - Application (menu-bar icon)
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var item: NSStatusItem!
@@ -638,9 +638,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var ready = false
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        // Jen jedna kopie: když už SFTP Drive běží (třeba z jiné složky), ukáže se ta a tahle skončí.
-        // Jen jedna kopie aplikace. Starší verzi (aktualizace) nebo kopii, která běží ze starých
-        // souborů (aplikace byla mezitím nahrazena), ukončí a pokračuje tahle.
+        // Only one copy of the app. An older version (update) or a copy running from stale
+        // files (the app was replaced in the meantime) is terminated and this one carries on.
         let me = ProcessInfo.processInfo.processIdentifier
         let fromLogin = ProcessInfo.processInfo.environment["SFTPDRIVE_LOGIN"] == "1"
         if let other = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "cz.sftpdrive.app")
@@ -648,12 +647,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let mine = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
             let theirs = Bundle(url: url)?.infoDictionary?["CFBundleVersion"] as? String ?? "0"
             if !fromLogin && (mine.compare(theirs, options: .numeric) == .orderedDescending || isStale(other)) {
-                // ať ji launchd po ukončení hned znovu nespustí (KeepAlive) – při příštím přihlášení se načte zase
+                // keep launchd from respawning it right away (KeepAlive) – it is loaded again at the next login
                 _ = runTool("/bin/launchctl", ["bootout", "gui/\(getuid())/\(loginLabel)"])
                 other.forceTerminate()
                 for _ in 0..<30 where !other.isTerminated { usleep(100_000) }
             } else {
-                if !fromLogin { shell("/usr/bin/open", [url.path]) }   // ukázat menu té, která už běží
+                if !fromLogin { shell("/usr/bin/open", [url.path]) }   // show the menu of the copy that is already running
                 exit(0)
             }
         }
@@ -681,21 +680,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Rozšíření Finderu a spouštění po přihlášení potřebují aplikaci ve složce Aplikace.
-    /// Vrací true, když se aplikace přesouvá (a tahle kopie končí).
+    /// The Finder extension and launch-at-login need the app to live in /Applications.
+    /// Returns true when the app is being moved (and this copy quits).
     func offerMoveToApplications() -> Bool {
         let path = Bundle.main.bundlePath
         if path.hasPrefix("/Applications/") || path.hasPrefix(home + "/Applications/") { return false }
         let dest = "/Applications/SFTP Drive.app"
-        guard alert("Přesunout SFTP Drive do Aplikací?",
-                    "Aby fungovaly položky v menu Finderu a automatické spuštění po zapnutí Macu, musí být aplikace ve složce Aplikace.",
-                    buttons: ["Přesunout do Aplikací", "Teď ne"]) == 0 else { return false }
+        guard alert("Move SFTP Drive to Applications?",
+                    "For the Finder menu items and for starting automatically after boot, the app has to be in the Applications folder.",
+                    buttons: ["Move to Applications", "Not now"]) == 0 else { return false }
         let fm = FileManager.default
         do {
             if fm.fileExists(atPath: dest) { try fm.trashItem(at: URL(fileURLWithPath: dest), resultingItemURL: nil) }
             do { try fm.moveItem(atPath: path, toPath: dest) } catch { try fm.copyItem(atPath: path, toPath: dest) }
         } catch {
-            alert("Přesun se nepovedl", error.localizedDescription + "\n\nPřetáhni aplikaci do Aplikací ručně.", style: .warning)
+            alert("Move failed", error.localizedDescription + "\n\nDrag the app into Applications manually.", style: .warning)
             return false
         }
         let p = Process()
@@ -705,7 +704,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         exit(0)
     }
 
-    // --- rozšíření Finderu (menu pravého tlačítka) ---
+    // --- Finder extension (context menu) ---
     var finderExtOn = false
     var appexPath: String? {
         guard let p = Bundle.main.builtInPlugInsURL?.appendingPathComponent("SFTPDriveFinder.appex").path,
@@ -737,14 +736,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.finderExtOn = on
                 self.rebuildMenu()
                 if turnOn && !on {
-                    alert("Položky ve Finderu se nepodařilo zapnout",
-                          "Zapni je ručně: Nastavení systému → Obecné → Položky a rozšíření → Rozšíření Finderu → SFTP Drive.")
+                    alert("Could not enable the Finder menu items",
+                          "Enable them manually: System Settings → General → Login Items & Extensions → Finder Extensions → SFTP Drive.")
                 }
             }
         }
     }
 
-    // --- akce z menu Finderu (sftpdrive://pin?p=…) ---
+    // --- actions from the Finder menu (sftpdrive://pin?p=…) ---
     func application(_ application: NSApplication, open urls: [URL]) {
         for u in urls where u.scheme == "sftpdrive" {
             if u.host == "choose", let c = URLComponents(url: u, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "c" })?.value {
@@ -760,30 +759,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Aplikace v liště nemá viditelné menu, ale bez menu Úpravy nefungují ⌘C / ⌘V / ⌘X / ⌘A / ⌘Z v polích.
+    /// A menu-bar app has no visible main menu, but without an Edit menu ⌘C / ⌘V / ⌘X / ⌘A / ⌘Z do not work in text fields.
     func installEditMenu() {
         let main = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "Zavřít okno", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        appMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         appItem.submenu = appMenu
         main.addItem(appItem)
 
         let editItem = NSMenuItem()
-        let edit = NSMenu(title: "Úpravy")
-        edit.addItem(withTitle: "Zpět", action: Selector(("undo:")), keyEquivalent: "z")
-        edit.addItem(withTitle: "Znovu", action: Selector(("redo:")), keyEquivalent: "Z")
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
         edit.addItem(.separator())
-        edit.addItem(withTitle: "Vyjmout", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
-        edit.addItem(withTitle: "Kopírovat", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        edit.addItem(withTitle: "Vložit", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
-        edit.addItem(withTitle: "Vybrat vše", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = edit
         main.addItem(editItem)
         NSApp.mainMenu = main
     }
 
-    // --- instalace / aktualizace skriptu a rclone ---
+    // --- installing / updating the script and rclone ---
     func ensureBackend(done: @escaping (Bool) -> Void) {
         guard let bundled = bundledScript else { done(FileManager.default.fileExists(atPath: installedBin)); return }
         let fm = FileManager.default
@@ -797,8 +796,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.title = "SFTP Drive"
         let sp = NSProgressIndicator(); sp.style = .spinning; sp.startAnimation(nil)
         let txt = NSTextField(wrappingLabelWithString: hasRclone
-            ? "Připravuji SFTP Drive…"
-            : "Připravuji SFTP Drive – stahuji rclone (jen poprvé, chvilku to trvá)…")
+            ? "Preparing SFTP Drive…"
+            : "Preparing SFTP Drive – downloading rclone (first run only, takes a moment)…")
         let st = NSStackView(views: [sp, txt])
         st.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
         st.spacing = 14
@@ -809,14 +808,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         runAsync(["install"], script: bundled) { r in
             panel.close()
             if !r.ok {
-                alert("Instalace se nepovedla", r.errorText + "\n\nZkontroluj připojení k internetu a spusť aplikaci znovu.", style: .critical)
+                alert("Installation failed", r.errorText + "\n\nCheck your internet connection and start the app again.", style: .critical)
                 NSApp.terminate(nil)
             }
             done(r.ok)
         }
     }
 
-    // --- spouštění po přihlášení ---
+    // --- launch at login ---
     var loginEnabled: Bool { FileManager.default.fileExists(atPath: loginPlist) }
 
     func ensureLoginItem() {
@@ -825,7 +824,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             d.set(true, forKey: "loginConfigured")
             setLogin(true)
         } else if loginEnabled {
-            setLogin(true) // přepsat cestu, kdyby se aplikace přesunula
+            setLogin(true) // rewrite the path in case the app was moved
         }
     }
 
@@ -833,7 +832,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if on {
             let plist: [String: Any] = [
                 "Label": loginLabel,
-                // přímo program aplikace: po pádu ho macOS spustí znovu (po ručním „Ukončit“ ne)
+                // the app's own executable: macOS restarts it after a crash (but not after a manual Quit)
                 "ProgramArguments": [Bundle.main.executablePath ?? Bundle.main.bundlePath + "/Contents/MacOS/SFTPDrive"],
                 "RunAtLoad": true,
                 "KeepAlive": ["SuccessfulExit": false],
@@ -849,7 +848,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // --- stav ---
+    // --- state ---
     func refresh(_ then: (() -> Void)? = nil) {
         guard ready, !refreshing else { then?(); return }
         refreshing = true
@@ -865,11 +864,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Aplikaci mezitím nahradila nová verze (přetažením do Aplikací) → spustit novou a tuhle ukončit.
+    /// The app was replaced by a newer version in the meantime (dragged into Applications) → start the new one, quit this one.
     func restartIfUpdated() {
         guard isStale(NSRunningApplication.current) else { return }
         if ProcessInfo.processInfo.environment["SFTPDRIVE_LOGIN"] == "1" {
-            exit(1)   // spuštěno při přihlášení → launchd ji hned spustí znovu, už novou
+            exit(1)   // started at login → launchd starts it again right away, now the new version
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -878,7 +877,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         exit(0)
     }
 
-    // --- samooprava: synchronizace, kterou nikdo nepozastavil, musí běžet (i po startu Macu) ---
+    // --- self-healing: a sync that nobody paused must be running (also after boot) ---
     var healTried: [String: Date] = [:]
     var healFailures: [String: Int] = [:]
     var healWarned = false
@@ -892,8 +891,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.healFailures[c.name, default: 0] += 1
                 if self.healFailures[c.name]! >= 2 && !self.healWarned {
                     self.healWarned = true
-                    alert("Synchronizace „\(c.label)“ se nespouští",
-                          "macOS nejspíš nepovolil běh na pozadí. Otevři Nastavení systému → Obecné → Položky při přihlášení a rozšíření a povol „sftpdrive“ a „SFTP Drive“.",
+                    alert("Sync of “\(c.label)” is not starting",
+                          "macOS probably blocked running in the background. Open System Settings → General → Login Items & Extensions and allow “sftpdrive” and “SFTP Drive”.",
                           style: .warning)
                 }
             }
@@ -929,9 +928,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(head)
 
         if !ready {
-            menu.addItem(NSMenuItem(title: "Připravuji…", action: nil, keyEquivalent: ""))
+            menu.addItem(NSMenuItem(title: "Preparing…", action: nil, keyEquivalent: ""))
         } else if conns.isEmpty {
-            menu.addItem(NSMenuItem(title: "Zatím žádný server", action: nil, keyEquivalent: ""))
+            menu.addItem(NSMenuItem(title: "No server yet", action: nil, keyEquivalent: ""))
         }
 
         for c in conns {
@@ -946,54 +945,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             if c.mountEnabled {
                 if c.mounted {
-                    menu.addItem(mi("Otevřít celý server (online)", #selector(openPath(_:)), c.mountDir, symbol: "globe"))
+                    menu.addItem(mi("Open the whole server (online)", #selector(openPath(_:)), c.mountDir, symbol: "globe"))
                 } else {
-                    menu.addItem(mi("Online složka odpojena – připojit", #selector(start(_:)), c.name, symbol: "globe"))
+                    menu.addItem(mi("Online folder disconnected – reconnect", #selector(start(_:)), c.name, symbol: "globe"))
                 }
             }
-            menu.addItem(mi("Otevřít složku „\(c.label)“", #selector(openPath(_:)), c.offlineDir, symbol: "folder"))
-            menu.addItem(mi("Synchronizovat teď", #selector(syncNow(_:)), c.name, symbol: "arrow.triangle.2.circlepath"))
+            menu.addItem(mi("Open folder “\(c.label)”", #selector(openPath(_:)), c.offlineDir, symbol: "folder"))
+            menu.addItem(mi("Sync now", #selector(syncNow(_:)), c.name, symbol: "arrow.triangle.2.circlepath"))
 
-            menu.addItem(mi("Vybrat synchronizované složky…", #selector(chooseFolders(_:)), c.name, symbol: "checklist"))
+            menu.addItem(mi("Choose synchronised folders…", #selector(chooseFolders(_:)), c.name, symbol: "checklist"))
 
-            // další volby
+            // more options
             let more = NSMenu()
             more.addItem(c.running
-                ? mi("Pozastavit", #selector(stop(_:)), c.name, symbol: "pause")
-                : mi("Spustit", #selector(start(_:)), c.name, symbol: "play"))
-            more.addItem(mi("Přejmenovat složku…", #selector(renameConn(_:)), c.name, symbol: "pencil"))
-            more.addItem(mi("Změnit heslo…", #selector(changePassword(_:)), c.name, symbol: "key"))
-            more.addItem(mi("Zobrazit log", #selector(showLog(_:)), c.name, symbol: "doc.text"))
+                ? mi("Pause", #selector(stop(_:)), c.name, symbol: "pause")
+                : mi("Resume", #selector(start(_:)), c.name, symbol: "play"))
+            more.addItem(mi("Rename folder…", #selector(renameConn(_:)), c.name, symbol: "pencil"))
+            more.addItem(mi("Change password…", #selector(changePassword(_:)), c.name, symbol: "key"))
+            more.addItem(mi("Show log", #selector(showLog(_:)), c.name, symbol: "doc.text"))
             more.addItem(.separator())
             let info = NSMenuItem(title: c.url, action: nil, keyEquivalent: "")
             more.addItem(info)
             more.addItem(.separator())
-            more.addItem(mi("Odebrat tento server…", #selector(removeConn(_:)), c.name, symbol: "trash"))
-            let moreItem = NSMenuItem(title: "Další", action: nil, keyEquivalent: "")
+            more.addItem(mi("Remove this server…", #selector(removeConn(_:)), c.name, symbol: "trash"))
+            let moreItem = NSMenuItem(title: "More", action: nil, keyEquivalent: "")
             moreItem.image = sfSymbol("ellipsis.circle")
             moreItem.submenu = more
             menu.addItem(moreItem)
         }
 
         menu.addItem(.separator())
-        let add = mi("Přidat server…", #selector(showAddAction), key: "n", symbol: "plus")
+        let add = mi("Add server…", #selector(showAddAction), key: "n", symbol: "plus")
         add.isEnabled = ready
         menu.addItem(add)
-        menu.addItem(mi("Jak to funguje?", #selector(help), symbol: "questionmark.circle"))
-        let login = mi("Spouštět po přihlášení", #selector(toggleLogin))
+        menu.addItem(mi("How does it work?", #selector(help), symbol: "questionmark.circle"))
+        let login = mi("Launch at login", #selector(toggleLogin))
         login.state = loginEnabled ? .on : .off
         menu.addItem(login)
         if appexPath != nil {
-            let fx = mi("Položky SFTP v menu Finderu", #selector(toggleFinderExt))
+            let fx = mi("SFTP items in the Finder menu", #selector(toggleFinderExt))
             fx.state = finderExtOn ? .on : .off
             menu.addItem(fx)
         }
-        menu.addItem(mi("Odinstalovat SFTP Drive…", #selector(uninstall)))
+        menu.addItem(mi("Uninstall SFTP Drive…", #selector(uninstall)))
         menu.addItem(.separator())
-        menu.addItem(mi("Ukončit ikonku", #selector(quit), key: "q"))
+        menu.addItem(mi("Quit menu-bar icon", #selector(quit), key: "q"))
     }
 
-    // --- akce ---
+    // --- actions ---
     @objc func showAddAction() { showAdd() }
 
     func showAdd() {
@@ -1028,12 +1027,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let n = s.representedObject as? String, let c = conns.first(where: { $0.name == n }) else { return }
         let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
         f.stringValue = c.label
-        guard alert("Přejmenovat složku „\(c.label)“", "Nový název složky ve Finderu (smí mít mezery i diakritiku):",
-                    buttons: ["Přejmenovat", "Zrušit"], accessory: f) == 0 else { return }
+        guard alert("Rename folder “\(c.label)”", "New folder name in Finder (spaces and accents are fine):",
+                    buttons: ["Rename", "Cancel"], accessory: f) == 0 else { return }
         let new = f.stringValue.trimmingCharacters(in: .whitespaces)
         guard !new.isEmpty, new != c.label else { return }
         runAsync(["rename", n, new]) { r in
-            if !r.ok { alert("Přejmenování se nepovedlo", r.errorText, style: .warning) }
+            if !r.ok { alert("Renaming failed", r.errorText, style: .warning) }
             self.refresh()
         }
     }
@@ -1049,7 +1048,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh()
         runAsync(["sync", n]) { r in
             self.refresh()
-            if !r.ok { alert("Synchronizace se nepovedla", r.errorText, style: .warning) }
+            if !r.ok { alert("Sync failed", r.errorText, style: .warning) }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.refresh() }
     }
@@ -1067,11 +1066,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func changePassword(_ s: NSMenuItem) {
         guard let n = s.representedObject as? String else { return }
         let f = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        f.placeholderString = "nové heslo"
-        guard alert("Změnit heslo pro „\(n)“", "Použij, když se heslo na serveru změnilo. Uloží se do Klíčenky.",
-                    buttons: ["Uložit", "Zrušit"], accessory: f) == 0, !f.stringValue.isEmpty else { return }
+        f.placeholderString = "new password"
+        guard alert("Change the password for “\(n)”", "Use this when the password on the server has changed. It is stored in the Keychain.",
+                    buttons: ["Save", "Cancel"], accessory: f) == 0, !f.stringValue.isEmpty else { return }
         runAsync(["password", n], stdin: f.stringValue + "\n") { r in
-            if !r.ok { alert("Heslo se nepodařilo uložit", r.errorText, style: .warning) }
+            if !r.ok { alert("Could not save the password", r.errorText, style: .warning) }
             self.refresh()
         }
     }
@@ -1085,33 +1084,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func removeConn(_ s: NSMenuItem) {
         guard let n = s.representedObject as? String else { return }
-        let box = NSButton(checkboxWithTitle: "Smazat i místní offline kopii", target: nil, action: nil)
-        guard alert("Odebrat server „\(n)“?", "Soubory na serveru zůstanou beze změny.",
-                    buttons: ["Odebrat", "Zrušit"], style: .warning, accessory: box) == 0 else { return }
+        let box = NSButton(checkboxWithTitle: "Also delete the local copy", target: nil, action: nil)
+        guard alert("Remove server “\(n)”?", "Files on the server stay untouched.",
+                    buttons: ["Remove", "Cancel"], style: .warning, accessory: box) == 0 else { return }
         var args = ["remove"]
         if box.state == .on { args.append("--delete-local") }
         runAsync(args + [n]) { r in
-            if !r.ok { alert("Odebrání se nepovedlo", r.errorText, style: .warning) }
+            if !r.ok { alert("Removal failed", r.errorText, style: .warning) }
             self.refresh()
         }
     }
 
     @objc func help() {
-        alert("Jak SFTP Drive funguje",
+        alert("How SFTP Drive works",
               """
-              Ve Finderu je složka „SFTP Drive“ a v ní pro každý server obyčejná složka (jako u Google Disku). Soubory jsou na disku, takže fungují i bez internetu, a synchronizují se oběma směry.
+              In Finder there is a folder “SFTP Drive” containing a plain folder for every server (like Google Drive). The files are on your disk, so they work offline too, and they sync both ways.
 
-              • Co do složky nakopíruješ, nahraje se na server.
-              • Co v ní smažeš, smaže se i na serveru.
-              • Když se soubor změní na obou stranách, nic se neztratí – starší verze se uloží jako „soubor.konflikt1“.
+              • Whatever you copy into the folder is uploaded to the server.
+              • Whatever you delete there is deleted on the server too.
+              • If a file changes on both sides nothing is lost – the older version is kept as “file.conflict1”.
 
-              Které složky ze serveru se stahují, vybereš v menu → „Vybrat synchronizované složky…“ (nebo pravým tlačítkem ve Finderu). Co odškrtneš, smaže se jen z Macu – na serveru zůstane.
+              Choose which folders are downloaded in the menu → “Choose synchronised folders…” (or right-click in Finder). Whatever you uncheck is removed from the Mac only – it stays on the server.
 
-              Když vypadne internet, pracuj dál normálně. Soubory, které ještě nejsou na serveru, mají ve Finderu oranžový štítek „Čeká na nahrání“ – po obnovení spojení se samy nahrají a štítek zmizí.
+              When the internet drops, keep working as usual. Files that are not on the server yet carry an orange Finder tag “Waiting to upload” – once the connection is back they upload by themselves and the tag disappears.
 
-              Tip: vyber ve Finderu složku „SFTP Drive“ a stiskni ⌃⌘T – bude v postranním panelu.
+              Tip: select the “SFTP Drive” folder in Finder and press ⌃⌘T – it will be in the sidebar.
 
-              Ikonka v liště: ✓ synchronizováno · ↻ probíhá · ⚠ chyba · přeškrtnutý obláček = server nedostupný.
+              Menu-bar icon: ✓ synced · ↻ in progress · ⚠ error · crossed-out cloud = server unreachable.
               """)
     }
 
@@ -1121,10 +1120,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func uninstall() {
-        let box = NSButton(checkboxWithTitle: "Smazat i místní offline kopie", target: nil, action: nil)
-        guard alert("Odinstalovat SFTP Drive?",
-                    "Odpojí všechny servery a odstraní nastavení i hesla z Klíčenky. Soubory na serveru zůstanou beze změny.",
-                    buttons: ["Odinstalovat", "Zrušit"], style: .warning, accessory: box) == 0 else { return }
+        let box = NSButton(checkboxWithTitle: "Also delete the local copies", target: nil, action: nil)
+        guard alert("Uninstall SFTP Drive?",
+                    "This disconnects all servers and removes the settings and the passwords from the Keychain. Files on the servers stay untouched.",
+                    buttons: ["Uninstall", "Cancel"], style: .warning, accessory: box) == 0 else { return }
         timer?.invalidate()
         let del = box.state == .on
         let names = conns.map { $0.name }
@@ -1137,11 +1136,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.setLogin(false)
                 UserDefaults.standard.removePersistentDomain(forName: Bundle.main.bundleIdentifier ?? "cz.sftpdrive.app")
                 self.item.isVisible = false
-                // aplikaci samu přesunout do Koše
+                // move the app itself to the Trash
                 NSWorkspace.shared.recycle([Bundle.main.bundleURL]) { _, err in
-                    alert(r.ok ? "SFTP Drive je odinstalovaný" : "Odinstalace skončila s chybou",
-                          (r.ok ? "Synchronizace je vypnutá a aplikace je v Koši." : r.errorText) +
-                          (err == nil ? "" : "\n\nAplikaci přetáhni do Koše ručně."))
+                    alert(r.ok ? "SFTP Drive has been uninstalled" : "Uninstall finished with an error",
+                          (r.ok ? "Synchronisation is switched off and the app is in the Trash." : r.errorText) +
+                          (err == nil ? "" : "\n\nDrag the app to the Trash manually."))
                     exit(0)
                 }
             }
@@ -1149,11 +1148,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func quit() {
-        if alert("Ukončit ikonku?", "Synchronizace poběží dál na pozadí. Ikonku znovu spustíš otevřením aplikace SFTP Drive.",
-              buttons: ["Ukončit", "Zrušit"]) == 0 { NSApp.terminate(nil) }
+        if alert("Quit the menu-bar icon?", "Synchronisation keeps running in the background. Open the SFTP Drive app to bring the icon back.",
+              buttons: ["Quit", "Cancel"]) == 0 { NSApp.terminate(nil) }
     }
 
-    // opětovné otevření aplikace (dvojklik, když už běží)
+    // the app is opened again (double-click while it is already running)
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !ready { return false }
         if conns.isEmpty { showAdd() } else { item.button?.performClick(nil) }

@@ -1,155 +1,140 @@
-# MacDrop SFTP — SFTP Drive pro macOS
+# MacDrop SFTP — SFTP Drive for macOS
 
-**Tvůj SFTP, FTP nebo FTPS server jako obyčejná složka ve Finderu – s oboustrannou synchronizací, jako Google Disk.**
+**Your SFTP, FTP or FTPS server as a plain folder in Finder – with two-way sync, like Google Drive.**
 
-Přidáš server, vybereš název složky a hotovo: ve Finderu se objeví `SFTP Drive → <název>`, soubory ze serveru se stáhnou
-a všechno, co do složky nakopíruješ nebo v ní upravíš, se samo nahraje zpátky. Funguje to i bez internetu – změny
-se dorovnají, jakmile se spojení vrátí.
+Add a server, pick a folder name, done: `SFTP Drive → <name>` appears in Finder, the files from the server are
+downloaded, and everything you copy into the folder or edit there is uploaded automatically. It keeps working
+without internet – changes are caught up as soon as the connection is back.
 
 <p align="center">
-  <img src="docs/add-server.png" width="49%" alt="Okno Přidat server">
-  <img src="docs/choose-folders.png" width="40%" alt="Výběr synchronizovaných složek">
+  <img src="docs/add-server.png" width="49%" alt="Add server window">
+  <img src="docs/choose-folders.png" width="40%" alt="Choosing which folders to synchronise">
 </p>
 
-> 🇬🇧 English summary is [at the bottom](#english).
+## Features
 
-## Co umí
+- **SFTP, FTP and FTPS** – log in with a password or an SSH key, as many servers as you like.
+- **A plain folder on your disk** – no network drive, no "eject" prompts, no "connection interrupted" dialogs.
+- **Two-way sync** – changes made on the Mac go to the server, changes on the server are downloaded.
+- **Choose what to keep** – sync the whole server or just selected folders (the rest stays on the server only).
+- **Works offline** – files waiting to be uploaded carry an orange Finder tag *Waiting to upload*.
+- **No lost data on conflicts** – if a file changes on both sides the newer one wins and the older one is kept as `file.conflict1.txt`.
+- **Menu-bar icon** with the status (✓ synced / ↻ syncing / ⚠ error / crossed-out = no connection).
+- **Finder context menu** – *Choose synchronised folders…*, *Stop syncing – free up space*.
+- **Reliable start** – after boot everything launches by itself, waits for the network if there is none, and
+  repairs itself if a service fails to start.
+- **Secure** – passwords live only in the macOS Keychain, SFTP host keys are pinned (protection against a spoofed server).
 
-- **SFTP, FTP i FTPS** – přihlášení heslem nebo SSH klíčem, víc serverů najednou.
-- **Obyčejná složka na disku** – žádný síťový disk, žádné „vysunout“ ani hlášky o přerušeném spojení.
-- **Oboustranná synchronizace** – změny z Macu jdou na server, změny ze serveru se stáhnou samy.
-- **Výběr složek** – synchronizuj celý server, nebo jen vybrané složky (ostatní zůstanou jen na serveru).
-- **Práce bez internetu** – soubory čekající na nahrání mají ve Finderu oranžový štítek *Čeká na nahrání*.
-- **Konflikty bez ztráty dat** – když se soubor změní na obou stranách, novější vyhraje a starší se uloží jako `soubor.konflikt1.txt`.
-- **Ikonka v horní liště** se stavem (✓ / ↻ / ⚠ / bez připojení) a menu pro všechno podstatné.
-- **Menu pravého tlačítka ve Finderu** – *Vybrat synchronizované složky*, *Přestat synchronizovat – uvolnit místo*.
-- **Spolehlivý start** – po zapnutí Macu se vše spustí samo, bez internetu počká, když něco nenaběhne, samo se to opraví.
-- **Bezpečně** – hesla jen v Klíčence macOS, otisk klíče SFTP serveru se ověřuje (ochrana proti podvrženému serveru).
+## Install
 
-## Instalace
-
-1. Stáhni **`SFTPDrive.zip`** z [Releases](../../releases/latest) a rozbal ho.
-2. Dvakrát klikni na **SFTP Drive**.
-   - macOS napíše, že aplikaci nelze ověřit (není podepsaná placeným certifikátem Apple):
-     **Nastavení systému → Soukromí a zabezpečení → dole „Přesto otevřít“**.
-   - Nebo v Terminálu (cestu uprav podle toho, kam jsi ZIP rozbalil):
+1. Download **`SFTPDrive.zip`** from the [latest release](../../releases/latest) and unzip it.
+2. Double-click **SFTP Drive**.
+   - macOS says it cannot verify the app (it is not signed with a paid Apple certificate):
+     **System Settings → Privacy & Security → scroll down → "Open Anyway"**.
+   - Or in Terminal (adjust the path to where you unzipped it):
      `find ~/Downloads/SFTPDrive -exec xattr -d com.apple.quarantine {} + 2>/dev/null`
-3. Aplikace nabídne přesun do **Aplikací** – potvrď.
-4. Poprvé si sama doinstaluje [rclone](https://rclone.org) (přes Homebrew, nebo z rclone.org) a otevře okno **Přidat server**.
-5. Hotovo. Tip: ve Finderu vyber složku **SFTP Drive** (je v domovské složce) a stiskni **⌃⌘T** – bude v postranním panelu.
+3. The app offers to move itself to **Applications** – confirm.
+4. On first launch it installs [rclone](https://rclone.org) (via Homebrew, or downloaded from rclone.org) and opens the **Add server** window.
+5. Done. Tip: select the **SFTP Drive** folder (in your home folder) in Finder and press **⌃⌘T** to add it to the sidebar.
 
-**Požadavky:** Mac s čipem Apple (M1 a novější), macOS 13 Ventura nebo novější.
+**Requirements:** Apple-silicon Mac (M1 or newer), macOS 13 Ventura or newer.
 
-**Aktualizace:** stáhni novou verzi, rozbal a spusť – starou sama nahradí.
+**Updating:** download the new version, unzip and open it – it replaces the old one automatically.
 
-## Používání
+## Usage
 
-| Chci… | Jak |
+| I want to… | How |
 |---|---|
-| přidat další server | ikonka v liště → **Přidat server…** |
-| vybrat, co se stahuje | ikonka v liště → **Vybrat synchronizované složky…** (nebo pravým tlačítkem ve Finderu) |
-| uvolnit místo na disku | pravým tlačítkem na složku → **Přestat synchronizovat – uvolnit místo (SFTP)** |
-| přejmenovat složku | ikonka v liště → Další → **Přejmenovat složku…** |
-| synchronizovat hned | ikonka v liště → **Synchronizovat teď** |
-| dočasně vypnout | ikonka v liště → Další → **Pozastavit** |
+| add another server | menu-bar icon → **Add server…** |
+| choose what is downloaded | menu-bar icon → **Choose synchronised folders…** (or right-click in Finder) |
+| free up disk space | right-click a folder → **Stop syncing – free up space (SFTP)** |
+| rename the folder | menu-bar icon → More → **Rename folder…** |
+| sync right now | menu-bar icon → **Sync now** |
+| pause temporarily | menu-bar icon → More → **Pause** |
 
-Co ve složce smažeš, smaže se i na serveru (stejně jako u Google Disku / OneDrivu). Pojistka: když by synchronizace
-měla smazat víc než polovinu souborů, zastaví se.
+Whatever you delete in the folder is deleted on the server too (just like Google Drive / OneDrive).
+Safety net: if a sync would delete more than half of the files it stops instead.
 
-## Odinstalace
+## Uninstall
 
-Ikonka v liště → **Odinstalovat SFTP Drive…**, nebo dvakrát klikni na `Odinstalovat.command` ze ZIPu (smaže úplně vše
-včetně nastavení a hesel). Data na serveru zůstanou beze změny.
+Menu-bar icon → **Uninstall SFTP Drive…**, or double-click `Uninstall.command` from the ZIP (removes everything,
+including settings and passwords). Data on the servers is never touched.
 
-## Omezení
+## Limitations
 
-- Jen Apple Silicon a macOS 13+.
-- Aplikace není podepsaná vývojářským certifikátem Apple → při prvním spuštění je potřeba „Přesto otevřít“.
-  Ze stejného důvodu Finder nezobrazí ikonky stavu přímo u souborů (to macOS dovolí jen podepsaným aplikacím) –
-  stav ukazuje ikonka v liště a štítek *Čeká na nahrání*.
-- Výběr složek funguje pro položky v kořeni serveru (podsložky se synchronizují celé).
-- Celý vybraný obsah se stahuje na disk (zrcadlení) – na obrovské servery je lepší vybrat jen některé složky.
+- Apple silicon and macOS 13+ only.
+- The app is not signed with an Apple developer certificate → "Open Anyway" is needed on first launch.
+  For the same reason Finder cannot show per-file status badges (macOS only allows that for signed apps) –
+  the status is shown by the menu-bar icon and the *Waiting to upload* tag instead.
+- The folder chooser works on the top-level items of the server (sub-folders are synced as a whole).
+- The selected content is mirrored to disk – for huge servers choose only some folders.
+- The app's user interface is currently in English only.
 
 ---
 
-## Pro vývojáře
+## For developers
 
-### Jak to funguje
+### How it works
 
 ```
 ┌──────────────────────────┐   sftpdrive _info / setup / _select …   ┌────────────────────────────┐
 │ SFTP Drive.app           │ ──────────────────────────────────────▶ │ sftpdrive  (bash)          │
-│  • ikonka v liště (Swift)│                                         │  • nastavení, Klíčenka     │
-│  • okna, samooprava      │ ◀── sftpdrive://… ── rozšíření Finderu  │  • launchd agent na server │
+│  • menu-bar icon (Swift) │                                         │  • settings, Keychain      │
+│  • windows, self-healing │ ◀── sftpdrive://… ── Finder extension   │  • one launchd agent/server│
 └──────────────────────────┘                                         └─────────────┬──────────────┘
                                                                                    │ rclone bisync
-                                         ~/SFTP Drive/<název>  ◀───────────────────┴───▶  server (SFTP/FTP/FTPS)
+                                         ~/SFTP Drive/<name>  ◀────────────────────┴───▶  server (SFTP/FTP/FTPS)
 ```
 
-- **`src/sftpdrive`** – jádro (bash, kompatibilní s macOS `/bin/bash` 3.2). Pro každý server vytvoří launchd agenta
-  `cz.sftpdrive.<připojení>.sync`, který běží na pozadí, reaguje na změny na disku (`fswatch`), každou minutu kontroluje
-  server a volá `rclone bisync`. Bez internetu zkouší spojení každých 10 s.
-- **`src/app/main.swift`** – aplikace v liště (AppKit, bez Xcode projektu). Jen volá skript a zobrazuje stav.
-- **`src/app/finder.swift`** – rozšíření Finderu (FinderSync) s položkami v menu pravého tlačítka.
-- **`src/app/tag.swift`** – malý pomocník, který nastavuje/odebírá štítek *Čeká na nahrání* (zachová ostatní štítky).
-- **`src/app/make-icon.swift`** – vykreslí ikonu aplikace při sestavení.
+- **`src/sftpdrive`** – the engine (bash, compatible with macOS `/bin/bash` 3.2). For every server it creates a launchd
+  agent `cz.sftpdrive.<connection>.sync` that runs in the background, reacts to file changes (`fswatch`), checks the
+  server every minute and calls `rclone bisync`. Without internet it retries every 10 s.
+- **`src/app/main.swift`** – the menu-bar app (AppKit, no Xcode project). It only calls the script and shows the state.
+- **`src/app/finder.swift`** – the Finder extension (FinderSync) with the context-menu items.
+- **`src/app/tag.swift`** – a tiny helper that sets/removes the *Waiting to upload* tag (keeps other tags intact).
+- **`src/app/make-icon.swift`** – renders the app icon during the build.
 
-### Kde jsou data
+### Where the data lives
 
-| Co | Kde |
+| What | Where |
 |---|---|
-| synchronizované soubory | `~/SFTP Drive/<název>/` |
-| nastavení serverů | `~/.config/sftpdrive/<připojení>/` (`config`, `rclone.conf`, `offline.list`, `known_hosts`) |
-| hesla | Klíčenka macOS, služba `sftpdrive:<připojení>:pass` |
-| logy | `~/Library/Logs/sftpdrive/` (otevřeš i z menu → Zobrazit log) |
-| služby na pozadí | `~/Library/LaunchAgents/cz.sftpdrive.*.plist` |
+| synchronised files | `~/SFTP Drive/<name>/` |
+| server settings | `~/.config/sftpdrive/<connection>/` (`config`, `rclone.conf`, `offline.list`, `known_hosts`) |
+| passwords | macOS Keychain, service `sftpdrive:<connection>:pass` |
+| logs | `~/Library/Logs/sftpdrive/` (also: menu → More → Show log) |
+| background services | `~/Library/LaunchAgents/cz.sftpdrive.*.plist` |
 
-### Sestavení
+### Build
 
-Stačí Xcode Command Line Tools (`xcode-select --install`), žádný Xcode projekt:
+Only the Xcode Command Line Tools are needed (`xcode-select --install`), there is no Xcode project:
 
 ```bash
 ./build.command
 ```
 
-Výsledek je `dist/SFTPDrive.zip` (aplikace + návod + odinstalace). Aplikace je podepsaná ad-hoc.
+The result is `dist/SFTPDrive.zip` (app + guide + uninstaller). The app is ad-hoc signed.
 
-### Příkazová řádka
+### Command line
 
-Skript jde používat i bez aplikace (po prvním spuštění aplikace je v `~/.local/bin/sftpdrive`):
+The script can be used without the app (after the first launch it lives in `~/.local/bin/sftpdrive`):
 
 ```bash
-sftpdrive setup            # průvodce novým serverem
-sftpdrive status           # stav všech serverů
-sftpdrive sync             # synchronizovat hned
-sftpdrive help             # všechny příkazy
+sftpdrive setup            # wizard for a new server
+sftpdrive status           # state of all servers
+sftpdrive sync             # sync right now
+sftpdrive help             # all commands
 ```
 
-### Struktura repozitáře
+### Repository layout
 
 ```
-build.command            sestavení dist/SFTPDrive.zip
-src/sftpdrive            synchronizační jádro (bash)
-src/app/                 aplikace v liště, rozšíření Finderu, pomocné nástroje (Swift) + Info.plist
-src/package/             soubory, které jdou do ZIPu vedle aplikace (návod, odinstalace)
-docs/                    obrázky do README
+build.command            builds dist/SFTPDrive.zip
+src/sftpdrive            the sync engine (bash)
+src/app/                 menu-bar app, Finder extension, helper tools (Swift) + Info.plists
+src/package/             files shipped in the ZIP next to the app (guide, uninstaller)
+docs/                    screenshots for this README
 ```
 
-## Licence
+## License
 
-[MIT](LICENSE). Synchronizaci zajišťuje [rclone](https://rclone.org) (MIT), který si aplikace stáhne při prvním spuštění.
-
----
-
-## English
-
-**MacDrop SFTP (SFTP Drive)** turns any SFTP, FTP or FTPS server into a regular folder in Finder with two-way sync –
-like Google Drive in mirror mode. Files live on your disk (works offline), changes sync both ways in the background,
-and a menu-bar icon shows the status. The UI is in Czech.
-
-- **Install:** download `SFTPDrive.zip` from [Releases](../../releases/latest), unzip, open *SFTP Drive*
-  (first time: *System Settings → Privacy & Security → Open Anyway*, the app is not notarized). Apple Silicon, macOS 13+.
-- **How it works:** a small AppKit menu-bar app drives a bash engine (`src/sftpdrive`) that runs one launchd agent per
-  server and syncs with `rclone bisync`. Passwords are stored in the macOS Keychain, SFTP host keys are pinned.
-- **Build:** `./build.command` (needs only Xcode Command Line Tools) → `dist/SFTPDrive.zip`.
-- **License:** MIT.
+[MIT](LICENSE). Synchronisation is done by [rclone](https://rclone.org) (MIT), which the app downloads on first launch.

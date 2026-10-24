@@ -1,10 +1,10 @@
-// sftpdrive-tag add|remove <soubor>… (nebo "-" = seznam souborů ze vstupu, jeden na řádek)
-// Přidá / odebere oranžový štítek „Čeká na nahrání“. Ostatní štítky souboru zachová.
+// sftpdrive-tag add|remove <file>… (or "-" = list of files from stdin, one per line)
+// Adds / removes the orange Finder tag "Waiting to upload". Other tags on the file are kept.
 
 import Foundation
 
-let tagName = "Čeká na nahrání"
-let entry = tagName + "\n7"                       // 7 = oranžová barva štítku ve Finderu
+let tagName = "Waiting to upload"
+let entry = tagName + "\n7"                       // 7 = orange tag colour in Finder
 let key = "com.apple.metadata:_kMDItemUserTags"
 
 func readTags(_ p: String) -> [String] {
@@ -24,7 +24,7 @@ func writeTags(_ p: String, _ tags: [String]) {
 
 let args = Array(CommandLine.arguments.dropFirst())
 guard let mode = args.first, mode == "add" || mode == "remove" else {
-    FileHandle.standardError.write("použití: sftpdrive-tag add|remove <soubor>… | -\n".data(using: .utf8)!)
+    FileHandle.standardError.write("usage: sftpdrive-tag add|remove <file>… | -\n".data(using: .utf8)!)
     exit(2)
 }
 var paths = Array(args.dropFirst())

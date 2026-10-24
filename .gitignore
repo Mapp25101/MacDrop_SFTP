@@ -1,4 +1,4 @@
-# výstup sestavení (ZIP patří do GitHub Releases, ne do gitu)
+# build output (the ZIP belongs in GitHub Releases, not in git)
 dist/
 *.zip
 

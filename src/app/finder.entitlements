@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>com.apple.security.app-sandbox</key><true/>
-	<!-- jen čtení nastavení (které složky jsou offline) -->
+	<!-- read-only access to the settings (which folders are synced) -->
 	<key>com.apple.security.temporary-exception.files.home-relative-path.read-only</key>
 	<array>
 		<string>/.config/sftpdrive/</string>

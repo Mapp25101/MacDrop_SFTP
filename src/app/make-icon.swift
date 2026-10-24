@@ -1,4 +1,4 @@
-// Vykreslí ikonu aplikace (1024×1024 PNG) – modrý čtverec s bílým obláčkem.
+// Renders the app icon (1024×1024 PNG) – a blue rounded square with a white cloud.
 import AppKit
 let out = CommandLine.arguments[1]
 let S: CGFloat = 1024

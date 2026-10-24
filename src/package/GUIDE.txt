@@ -1,0 +1,69 @@
+SFTP DRIVE – an SFTP / FTP / FTPS server as a folder in Finder, like Google Drive
+==================================================================================
+
+INSTALL
+-------
+1. Unzip the download and double-click "SFTP Drive".
+2. If macOS says the app cannot be opened (unidentified developer):
+   System Settings → Privacy & Security → scroll down → "Open Anyway".
+3. The app offers to move itself to Applications – confirm.
+4. On first launch it installs the helper tool rclone and opens the
+   "Add server" window: protocol (SFTP / FTP / FTPS), address, port,
+   user name, password (stored in the Keychain) and a folder name,
+   e.g. "School".
+5. Done – a cloud icon appears in the menu bar and everything starts
+   automatically from now on.
+
+Tip: select the "SFTP Drive" folder (it lives in your home folder) in Finder
+and press ⌃⌘T – it appears in the sidebar, just like Google Drive.
+
+Update: unzip the new version and open it – it replaces the old one.
+Apple-silicon Macs only (M1 and newer), macOS 13 or newer.
+
+
+HOW IT WORKS
+------------
+Inside the "SFTP Drive" folder every server gets a plain folder (e.g.
+"School"). The files live on your disk, so they work offline, and they are
+synchronised both ways:
+  • whatever you copy into the folder or edit is uploaded to the server,
+  • whatever changes on the server is downloaded automatically,
+  • whatever you delete in the folder is deleted on the server too.
+If a file changes on both sides at once nothing is lost – the older version
+is kept next to it as "file.conflict1.txt".
+
+Choose which folders are downloaded in the menu-bar menu →
+"Choose synchronised folders…" (or right-click in Finder). Whatever you
+uncheck is removed from the Mac only – it stays on the server.
+
+
+WHEN THE INTERNET DROPS
+-----------------------
+Keep working as usual. Files that are not on the server yet carry an orange
+Finder tag "Waiting to upload". As soon as the connection is back they
+upload by themselves within seconds and the tag disappears. No warnings and
+no "eject disk" dialogs.
+
+
+AFTER STARTING THE MAC
+----------------------
+Everything starts by itself (the app and the synchronisation). If the Mac
+boots without internet, the sync waits and catches up as soon as the
+connection appears. If anything fails to start, the app repairs it within
+seconds. If macOS shows "Background item added" during the installation,
+leave it enabled.
+
+
+MENU-BAR ICON
+-------------
+✓ everything synced · ↻ syncing · ⚠ error · crossed-out = no connection
+The menu: open the folder, sync now, choose folders, rename the folder,
+pause, change the password, show the log, add another server, uninstall.
+If your menu bar is full macOS may hide the icon – click » in the bar.
+
+
+UNINSTALL
+---------
+Menu-bar icon → "Uninstall SFTP Drive…" (the app moves itself to the Trash),
+or double-click "Uninstall.command" from the ZIP – it removes everything.
+Data on the servers is never touched.

@@ -1,6 +1,6 @@
-// SFTP Drive – rozšíření Finderu: položky SFTP Drive v menu pravého tlačítka (výběr složek, uvolnit místo).
-// (Ikonky u souborů Finder bez vývojářského certifikátu Apple nezobrazí – stav ukazují štítky a ikonka v liště.)
-// Běží v sandboxu, jen čte nastavení z ~/.config/sftpdrive; akce posílá hlavní aplikaci přes odkaz sftpdrive://…
+// SFTP Drive – Finder extension: SFTP Drive items in the context menu (choose folders, free up space).
+// (Per-file status badges need an Apple developer certificate, so the status is shown by a Finder tag and the menu-bar icon.)
+// It runs in a sandbox, only reads the settings in ~/.config/sftpdrive and sends its actions to the main app via sftpdrive:// links.
 
 import Cocoa
 import FinderSync
@@ -11,7 +11,7 @@ let fm = FileManager.default
 
 func nfc(_ s: String) -> String { s.precomposedStringWithCanonicalMapping }
 
-/// Hodnota z config souboru (zapsaná přes bash printf %q).
+/// A value from the config file (written by bash printf %q).
 func unquote(_ v: String) -> String {
     if v == "''" { return "" }
     var out = "", single = false, esc = false
@@ -29,7 +29,7 @@ func unquote(_ v: String) -> String {
 
 struct Conn {
     let name: String
-    let mountDir: String      // prázdné = online složka vypnutá
+    let mountDir: String      // empty = online folder disabled
     let offlineDir: String
     let rules: [(pinned: Bool, path: String)]
 
@@ -52,7 +52,7 @@ struct Conn {
         }
     }
 
-    /// Stejná logika jako ve skriptu: rozhoduje nejkonkrétnější pravidlo.
+    /// Same logic as in the script: the most specific rule wins.
     func isPinned(_ rel: String) -> Bool {
         var best: Bool? = nil, bestLen = -1
         for r in rules where r.path == "/" || rel == r.path || rel.hasPrefix(r.path + "/") {
@@ -75,7 +75,7 @@ final class SFTPDriveFinderSync: FIFinderSync {
 
     override init() {
         super.init()
-        // celá ~/SFTP Drive – menu pak funguje i u serverů přidaných později
+        // the whole ~/SFTP Drive – so the menu also works for servers added later
         FIFinderSyncController.default().directoryURLs = [URL(fileURLWithPath: realHome + "/SFTP Drive"),
                                                           URL(fileURLWithPath: realHome + "/SFTP")]
     }
@@ -102,17 +102,17 @@ final class SFTPDriveFinderSync: FIFinderSync {
         chosenConn = conn.name
         let m = NSMenu(title: "")
         if canPin {
-            let i = m.addItem(withTitle: "Ponechat offline (SFTP)", action: #selector(pin(_:)), keyEquivalent: "")
+            let i = m.addItem(withTitle: "Sync this item (SFTP)", action: #selector(pin(_:)), keyEquivalent: "")
             i.image = NSImage(systemSymbolName: "icloud.and.arrow.down", accessibilityDescription: nil)
         }
         if canUnpin {
-            let i = m.addItem(withTitle: "Přestat synchronizovat – uvolnit místo (SFTP)", action: #selector(unpin(_:)), keyEquivalent: "")
+            let i = m.addItem(withTitle: "Stop syncing – free up space (SFTP)", action: #selector(unpin(_:)), keyEquivalent: "")
             i.image = NSImage(systemSymbolName: "icloud.and.arrow.up", accessibilityDescription: nil)
         }
-        let ch = m.addItem(withTitle: "Vybrat synchronizované složky… (SFTP)", action: #selector(choose(_:)), keyEquivalent: "")
+        let ch = m.addItem(withTitle: "Choose synchronised folders… (SFTP)", action: #selector(choose(_:)), keyEquivalent: "")
         ch.image = NSImage(systemSymbolName: "checklist", accessibilityDescription: nil)
         if online && urls.count == 1 {
-            let i = m.addItem(withTitle: "Zobrazit v druhé složce (SFTP)", action: #selector(reveal(_:)), keyEquivalent: "")
+            let i = m.addItem(withTitle: "Show in the other folder (SFTP)", action: #selector(reveal(_:)), keyEquivalent: "")
             i.image = NSImage(systemSymbolName: "arrow.left.arrow.right", accessibilityDescription: nil)
         }
         return m
