@@ -1,0 +1,7 @@
+# výstup sestavení (ZIP patří do GitHub Releases, ne do gitu)
+dist/
+*.zip
+
+# macOS
+.DS_Store
+Icon?

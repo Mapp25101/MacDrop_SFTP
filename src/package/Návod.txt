@@ -1,0 +1,64 @@
+SFTP DRIVE – server (SFTP / FTP / FTPS) jako složka ve Finderu, podobně jako Google Disk
+====================================================================================
+
+INSTALACE
+---------
+1. Rozbal ZIP a dvakrát klikni na „SFTP Drive“.
+2. Když macOS napíše, že aplikaci nelze otevřít (neověřený vývojář):
+   Nastavení systému → Soukromí a zabezpečení → dole „Přesto otevřít“.
+3. Aplikace nabídne přesun do složky Aplikace – potvrď.
+4. Poprvé se sama doinstaluje (stáhne nástroj rclone) a otevře okno
+   „Přidat server“: protokol (SFTP / FTP / FTPS), adresa, port, jméno,
+   heslo (uloží se do Klíčenky) a název složky – třeba „Škola“.
+5. Hotovo – nahoře v liště je ikonka obláčku a vše se spouští samo.
+
+Tip: ve Finderu vyber složku „SFTP Drive“ (je ve tvé domovské složce)
+a stiskni ⌃⌘T – bude v postranním panelu jako Google Disk.
+
+Aktualizace: stačí rozbalit novou verzi a spustit ji – starou sama nahradí.
+Jen pro Macy s čipem Apple (M1 a novější), macOS 13+.
+
+
+JAK TO FUNGUJE
+--------------
+Ve složce „SFTP Drive“ je pro každý server obyčejná složka (např. „Škola“).
+Soubory jsou na disku, takže fungují i bez internetu, a synchronizují se
+oběma směry:
+  • co do složky nakopíruješ nebo upravíš, nahraje se na server,
+  • co se změní na serveru, stáhne se samo,
+  • co ve složce smažeš, smaže se i na serveru.
+Když se soubor změní na obou stranách zároveň, nic se neztratí – starší
+verze se uloží vedle jako „soubor.konflikt1.txt“.
+
+Které složky ze serveru se stahují, vybereš v menu ikonky v liště →
+„Vybrat synchronizované složky…“ (nebo pravým tlačítkem ve Finderu).
+Co odškrtneš, smaže se jen z Macu – na serveru zůstane.
+
+
+KDYŽ VYPADNE INTERNET
+---------------------
+Pracuj dál normálně. Soubory, které ještě nejsou na serveru, mají ve Finderu
+oranžový štítek „Čeká na nahrání“. Jakmile se spojení obnoví, nahrají se
+samy do pár vteřin a štítek zmizí. Žádné hlášky ani vysouvání disku.
+
+
+PO ZAPNUTÍ MACU
+---------------
+Vše se spustí samo (aplikace i synchronizace). Když se Mac zapne bez internetu,
+synchronizace počká a sama se dožene, jakmile se spojení objeví. Když by se
+něco nespustilo, aplikace to do pár vteřin sama opraví. Pokud macOS při
+instalaci ukáže „Položka na pozadí přidána“, nech ji povolenou.
+
+IKONKA V LIŠTĚ
+--------------
+✓ vše synchronizováno · ↻ probíhá · ⚠ chyba · přeškrtnutá = bez připojení
+V menu: otevřít složku, synchronizovat hned, vybrat složky, přejmenovat
+složku, pozastavit, změnit heslo, log, přidat další server, odinstalovat.
+Když je horní lišta plná, macOS ikonku schová – klikni na » v liště.
+
+
+ODINSTALACE
+-----------
+Ikonka v liště → Odinstalovat SFTP Drive… (aplikace se sama přesune do Koše),
+nebo dvakrát klikni na „Odinstalovat.command“ ze ZIPu – ten smaže úplně vše.
+Data na serveru zůstanou beze změny.

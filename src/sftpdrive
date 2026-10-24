@@ -1,0 +1,1329 @@
+#!/bin/bash
+# shellcheck disable=SC1111  # české uvozovky „…“ v hláškách jsou záměrné
+# ============================================================================
+#  sftpdrive – synchronizační jádro aplikace SFTP Drive (MacDrop SFTP)
+#
+#  Server (SFTP / FTP / FTPS) se zrcadlí do obyčejné složky ~/SFTP Drive/<název>
+#  a synchronizuje oběma směry – podobně jako Google Disk v režimu zrcadlení.
+#
+#  Jak to funguje:
+#   • rclone bisync      oboustranná synchronizace složka ↔ server
+#   • launchd agent      cz.sftpdrive.<připojení>.sync běží na pozadí („_daemon“),
+#                        reaguje na změny na disku (fswatch) a každou minutu
+#                        kontroluje server; bez internetu zkouší co 10 s
+#   • offline.list       které složky z kořene serveru se synchronizují
+#                        („+ /cesta“ = ano, „- /cesta“ = výjimka; rozhoduje nejdelší)
+#   • Klíčenka macOS     hesla (nikdy se neukládají do souborů)
+#   • known_hosts        otisk klíče SFTP serveru (ochrana proti podvržení)
+#   • štítek Finderu     „Čeká na nahrání“ u souborů, které ještě nejsou na serveru
+#
+#  Nastavení:  ~/.config/sftpdrive/<připojení>/   Logy: ~/Library/Logs/sftpdrive/
+#  Aplikace v liště (app/main.swift) volá tenhle skript; jde použít i samostatně
+#  z Terminálu – viz „sftpdrive help“.
+#
+#  Kompatibilní s /bin/bash 3.2 (výchozí bash v macOS).
+# ============================================================================
+
+VERSION="2.2"
+APP_ID="cz.sftpdrive"
+CONF_ROOT="$HOME/.config/sftpdrive"
+LOG_ROOT="$HOME/Library/Logs/sftpdrive"
+CACHE_ROOT="$HOME/Library/Caches/sftpdrive"
+DRIVE_ROOT="$HOME/SFTP Drive"
+AGENT_DIR="$HOME/Library/LaunchAgents"
+SERVICES_DIR="$HOME/Library/Services"
+INSTALL_BIN="$HOME/.local/bin/sftpdrive"
+AGENT_PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="$AGENT_PATH:$PATH"
+
+GUI=0   # 1 = spuštěno z Finderu (Rychlá akce) → hlášky jako notifikace
+
+# ----------------------------------------------------------------------------
+#  Výstup a dotazy
+# ----------------------------------------------------------------------------
+if [ -t 1 ]; then
+  C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'; C_DIM=$'\033[2m'; C_B=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_RED=; C_GRN=; C_YEL=; C_DIM=; C_B=; C_OFF=
+fi
+
+notify() { # nadpis zpráva
+  /usr/bin/osascript - "$1" "$2" >/dev/null 2>&1 <<'EOF'
+on run argv
+  display notification (item 2 of argv) with title "SFTP Drive" subtitle (item 1 of argv)
+end run
+EOF
+}
+
+say()  { if [ "$GUI" = 1 ]; then notify "${2:-Hotovo}" "$1"; else printf '%s\n' "$1"; fi; }
+ok()   { printf '%s✔%s %s\n' "$C_GRN" "$C_OFF" "$*"; }
+warn() { printf '%s⚠ %s%s\n' "$C_YEL" "$*" "$C_OFF" >&2; }
+die()  {
+  printf '%s✖ %s%s\n' "$C_RED" "$*" "$C_OFF" >&2
+  [ "$GUI" = 1 ] && notify "Chyba" "$*"
+  exit 1
+}
+
+ask() { # otázka [výchozí] → $REPLY
+  local a
+  if [ -n "${2:-}" ]; then read -r -e -p "$1 [$2]: " a; else read -r -e -p "$1: " a; fi
+  REPLY="${a:-${2:-}}"
+}
+
+ask_yn() { # otázka výchozí(a|n) → návratový kód 0 = ano
+  local a hint="a/N"
+  [ "$2" = a ] && hint="A/n"
+  read -r -p "$1 [$hint]: " a
+  a="${a:-$2}"
+  case "$a" in a|A|ano|Ano|y|Y|yes) return 0 ;; *) return 1 ;; esac
+}
+
+nfc() { # převede cestu do Unicode NFC (Finder/APFS občas dává rozložené NFD)
+  printf '%s' "$1" | iconv -f UTF-8-MAC -t UTF-8 2>/dev/null || printf '%s' "$1"
+}
+
+# shellcheck disable=SC2088  # „~“ je tu jen text pro zobrazení
+pretty() { # zkrátí $HOME na ~
+  case "$1" in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac
+}
+
+need_rclone() {
+  command -v rclone >/dev/null 2>&1 && return 0
+  [ "$GUI" = 1 ] && die "Chybí rclone. Spusť znovu instalaci SFTP Drive."
+  [ -t 0 ] || die "Chybí rclone. Spusť: sftpdrive install"
+  install_rclone
+}
+
+install_rclone() { # rclone (+ fswatch) přes Homebrew, jinak oficiální binárka do ~/.local/bin
+  if command -v brew >/dev/null 2>&1; then
+    echo "Instaluji rclone a fswatch přes Homebrew…"
+    brew install rclone fswatch && return 0
+    warn "Homebrew selhal, zkusím oficiální rclone z rclone.org."
+  fi
+  local arch tmp
+  case "$(uname -m)" in arm64) arch=arm64 ;; *) arch=amd64 ;; esac
+  tmp=$(mktemp -d)
+  echo "Stahuji rclone z https://downloads.rclone.org …"
+  curl -fsSL "https://downloads.rclone.org/rclone-current-osx-$arch.zip" -o "$tmp/rclone.zip" \
+    || die "Stažení rclone selhalo (jsi online?)."
+  unzip -q "$tmp/rclone.zip" -d "$tmp" || die "Rozbalení rclone selhalo."
+  mkdir -p "$HOME/.local/bin"
+  cp -f "$tmp"/rclone-*/rclone "$HOME/.local/bin/rclone"
+  chmod +x "$HOME/.local/bin/rclone"
+  xattr -d com.apple.quarantine "$HOME/.local/bin/rclone" 2>/dev/null
+  rm -rf "$tmp"
+  command -v rclone >/dev/null 2>&1 || die "rclone se nepodařilo nainstalovat."
+  ok "rclone $(rclone version 2>/dev/null | head -1 | awk '{print $2}') nainstalován do ~/.local/bin"
+  echo "  (bez fswatch se změny kontrolují každých 60 s; okamžitou reakci přidá: brew install fswatch)"
+}
+
+# ----------------------------------------------------------------------------
+#  Připojení (konfigurace)
+# ----------------------------------------------------------------------------
+list_conns() {
+  local d
+  [ -d "$CONF_ROOT" ] || return 0
+  for d in "$CONF_ROOT"/*/; do
+    [ -f "$d/config" ] && basename "$d"
+  done
+}
+
+load_conn() { # název
+  NAME="$1"
+  CDIR="$CONF_ROOT/$NAME"
+  [ -f "$CDIR/config" ] || die "Připojení '$NAME' neexistuje (sftpdrive list)."
+  PROTO=sftp
+  LABEL=""
+  # shellcheck disable=SC1090
+  . "$CDIR/config"
+  [ -n "$LABEL" ] || LABEL=$(basename "$OFFLINE_DIR")
+  RCONF="$CDIR/rclone.conf"
+  RULES="$CDIR/offline.list"
+  FILTERS="$CDIR/filters.txt"
+  WORKDIR="$CDIR/bisync"
+  LOCK="$CDIR/lock"
+  STATE="$CDIR/state"
+  NEEDS_RESYNC="$CDIR/needs_resync"
+  CACHE_DIR="$CACHE_ROOT/$NAME"
+  LOG_SYNC="$LOG_ROOT/$NAME-sync.log"
+  LOG_MOUNT="$LOG_ROOT/$NAME-mount.log"
+  REMOTE="remote:$REMOTE_PATH"
+  LABEL_SYNC="$APP_ID.$NAME.sync"
+  LABEL_MOUNT="$APP_ID.$NAME.mount"
+  touch "$RULES"
+}
+
+resolve_name() { # [název] → vypíše název připojení
+  if [ -n "${1:-}" ]; then
+    [ -f "$CONF_ROOT/$1/config" ] || die "Připojení '$1' neexistuje. Dostupná: $(list_conns | tr '\n' ' ')"
+    printf '%s' "$1"; return
+  fi
+  local all n
+  all=$(list_conns)
+  n=$(printf '%s' "$all" | grep -c . )
+  [ "$n" -eq 0 ] && die "Zatím nemáš žádné připojení. Spusť: sftpdrive setup"
+  [ "$n" -gt 1 ] && die "Máš víc připojení ($(printf '%s' "$all" | tr '\n' ' ')) – napiš, které."
+  printf '%s' "$all"
+}
+
+remote_join() { # rel (/a/b) → remote:cesta/a/b
+  local rel="$1"
+  [ "$rel" = "/" ] && { printf '%s' "$REMOTE"; return; }
+  case "$REMOTE" in
+    *: | */) printf '%s%s' "$REMOTE" "${rel#/}" ;;
+    *)       printf '%s%s' "$REMOTE" "$rel" ;;
+  esac
+}
+
+local_join() { # base rel
+  [ "$2" = "/" ] && { printf '%s' "$1"; return; }
+  printf '%s%s' "$1" "$2"
+}
+
+# --- Klíčenka ---------------------------------------------------------------
+kc_svc() { printf 'sftpdrive:%s:%s' "$NAME" "$1"; }
+kc_get() { security find-generic-password -a "$SUSER@$HOST" -s "$(kc_svc "$1")" -w 2>/dev/null; }
+kc_set() { security add-generic-password -U -a "$SUSER@$HOST" -s "$(kc_svc "$1")" -l "SFTP Drive – $NAME" -w "$2" >/dev/null; }
+kc_del() { security delete-generic-password -a "$SUSER@$HOST" -s "$(kc_svc "$1")" >/dev/null 2>&1; }
+
+rclone_env() { # připraví proměnné pro rclone (heslo se bere z Klíčenky)
+  export RCLONE_CONFIG="$RCONF"
+  # Názvy souborů z Macu posílat na server v NFC (jinak dělá diakritika potíže).
+  export RCLONE_LOCAL_UNICODE_NORMALIZATION=true
+  unset RCLONE_SFTP_PASS RCLONE_SFTP_KEY_FILE_PASS RCLONE_FTP_PASS
+  local s
+  if [ "$AUTH" = password ]; then
+    s=$(kc_get pass) || { warn "Heslo pro '$NAME' není v Klíčence. Nastav ho: sftpdrive password $NAME"; return 1; }
+    if [ "${PROTO:-sftp}" = sftp ]; then
+      RCLONE_SFTP_PASS=$(printf '%s' "$s" | rclone obscure -); export RCLONE_SFTP_PASS
+    else
+      RCLONE_FTP_PASS=$(printf '%s' "$s" | rclone obscure -); export RCLONE_FTP_PASS
+    fi
+  elif s=$(kc_get keypass); then
+    RCLONE_SFTP_KEY_FILE_PASS=$(printf '%s' "$s" | rclone obscure -); export RCLONE_SFTP_KEY_FILE_PASS
+  fi
+}
+
+reachable() { nc -z -G 5 "$HOST" "$PORT" >/dev/null 2>&1; }
+
+is_mounted() { mount | grep -qF " on $MOUNT_DIR (" ; }
+
+rotate_log() { # soubor – ponechá max. ~5 MB
+  [ -f "$1" ] || return 0
+  [ "$(stat -f %z "$1" 2>/dev/null || echo 0)" -gt 5242880 ] && mv -f "$1" "$1.1"
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+#  Pravidla "offline" (co se drží na disku)
+#  Soubor offline.list: řádky "+ /cesta" (offline) a "- /cesta" (výjimka)
+#  Rozhoduje vždy nejkonkrétnější (nejdelší) pravidlo.
+# ----------------------------------------------------------------------------
+rule_for() { # rel → vypíše + / - / nic
+  local rel="$1" best="" bestlen=-1 line sign p len
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    sign=${line%% *}; p=${line#? }
+    if [ "$p" = "/" ] || [ "$rel" = "$p" ] || [ "${rel#"$p"/}" != "$rel" ]; then
+      len=${#p}; [ "$p" = "/" ] && len=0
+      if [ "$len" -gt "$bestlen" ]; then best=$sign; bestlen=$len; fi
+    fi
+  done < "$RULES"
+  printf '%s' "$best"
+}
+
+is_pinned() { [ "$(rule_for "$1")" = "+" ]; }
+
+rules_under() { # rel [znak] → existuje pravidlo (daného znaménka) hlouběji pod rel?
+  local rel="$1" want="${2:-}" line p
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    p=${line#? }
+    [ -n "$want" ] && [ "${line%% *}" != "$want" ] && continue
+    if [ "$rel" = "/" ]; then [ "$p" != "/" ] && return 0
+    elif [ "${p#"$rel"/}" != "$p" ]; then return 0; fi
+  done < "$RULES"
+  return 1
+}
+
+rules_drop_subtree() { # rel – smaže pravidla pro rel a vše pod ním
+  local rel="$1" line p tmp="$RULES.tmp"
+  : > "$tmp"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    p=${line#? }
+    if [ "$rel" = "/" ] || [ "$p" = "$rel" ] || [ "${p#"$rel"/}" != "$p" ]; then continue; fi
+    printf '%s\n' "$line" >> "$tmp"
+  done < "$RULES"
+  mv -f "$tmp" "$RULES"
+}
+
+rule_pin()   { rules_drop_subtree "$1"; is_pinned "$1" || printf '+ %s\n' "$1" >> "$RULES"; }
+rule_unpin() { rules_drop_subtree "$1"; is_pinned "$1" && printf -- '- %s\n' "$1" >> "$RULES"; }
+
+glob_escape() { printf '%s' "$1" | sed -e 's/[][\\*?{}]/\\&/g'; }
+
+write_filters() {
+  local tmp="$FILTERS.tmp" line sign p e
+  {
+    echo "# Generuje sftpdrive z offline.list – neupravovat ručně."
+    echo "- .DS_Store"
+    echo "- ._*"
+    echo "- .localized"
+    echo "- .~lock.*#"
+    echo "- ~\$*"
+    # nejkonkrétnější pravidla první (rclone bere první shodu)
+    awk '{ p=substr($0,3); n=(p=="/")?0:gsub("/","/",p); print n "\t" $0 }' "$RULES" \
+      | sort -t "$(printf '\t')" -k1,1nr | cut -f2- \
+      | while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          sign=${line%% *}; p=${line#? }
+          if [ "$p" = "/" ]; then
+            echo "$sign /**"
+          else
+            e=$(glob_escape "$p")
+            echo "$sign $e"
+            echo "$sign $e/**"
+          fi
+        done
+    echo "- **"
+  } > "$tmp"
+  if ! cmp -s "$tmp" "$FILTERS"; then mv -f "$tmp" "$FILTERS"; else rm -f "$tmp"; fi
+}
+
+only_junk_in() { # složka → 0, když v ní není nic kromě .DS_Store a ikony složky
+  local e
+  for e in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    [ -e "$e" ] || [ -L "$e" ] || continue
+    case "${e##*/}" in .DS_Store|Icon$'\r') ;; *) return 1 ;; esac
+  done
+  return 0
+}
+
+is_junk() { # název souboru, který nesynchronizujeme
+  case "$1" in .DS_Store|._*|.localized|.~lock.*\#|~\$*|Icon$'\r') return 0 ;; esac
+  return 1
+}
+
+# Najde v offline složce nové položky, které zatím nejsou "offline"
+# (uživatel je tam sám vytvořil/přetáhl) → vypíše jejich rel cesty.
+find_new_local() { # rel_dir
+  local dir="$1" base e name rel
+  base=$(local_join "$OFFLINE_DIR" "$dir")
+  for e in "$base"/* "$base"/.[!.]* "$base"/..?*; do
+    [ -e "$e" ] || [ -L "$e" ] || continue
+    name=$(nfc "${e##*/}")
+    is_junk "$name" && continue
+    if [ "$dir" = "/" ]; then rel="/$name"; else rel="$dir/$name"; fi
+    if is_pinned "$rel"; then
+      [ -d "$e" ] && rules_under "$rel" - && find_new_local "$rel"
+    elif rules_under "$rel" +; then
+      [ -d "$e" ] && find_new_local "$rel"
+    else
+      printf '%s\n' "$rel"
+    fi
+  done
+}
+
+# ----------------------------------------------------------------------------
+#  Zámek (aby se synchronizace nepřekrývaly)
+# ----------------------------------------------------------------------------
+boot_time() { sysctl -n kern.boottime | sed -E "s/.*sec = ([0-9]+).*/\1/"; }
+
+lock_acquire() { # [timeout s]
+  local t="${1:-3600}" waited=0 pid age
+  while ! mkdir "$LOCK" 2>/dev/null; do
+    # zámek z doby před restartem Macu (výpadek proudu apod.) je vždy neplatný
+    if [ "$(stat -f %m "$LOCK" 2>/dev/null || echo 0)" -lt "$(boot_time)" ]; then rm -rf "$LOCK"; continue; fi
+    pid=$(cat "$LOCK/pid" 2>/dev/null)
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -rf "$LOCK"; continue; fi
+    if [ -z "$pid" ]; then
+      age=$(( $(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || date +%s) ))
+      [ "$age" -gt 60 ] && { rm -rf "$LOCK"; continue; }
+    fi
+    [ "$waited" -eq 5 ] && [ "$GUI" != 1 ] && echo "Čekám na dokončení probíhající synchronizace…"
+    [ "$waited" -ge "$t" ] && return 1
+    sleep 1; waited=$((waited + 1))
+  done
+  echo $$ > "$LOCK/pid"
+  trap lock_release EXIT
+  trap 'exit 130' INT TERM
+}
+
+lock_release() {
+  [ -n "${LOCK:-}" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK"
+}
+
+# ----------------------------------------------------------------------------
+#  Stav + notifikace
+# ----------------------------------------------------------------------------
+set_state() { # ok|error|offline zpráva
+  local streak=0
+  printf "%s|%s|%s\n" "$1" "$(date "+%Y-%m-%d %H:%M:%S")" "$2" > "$STATE"
+  # upozornit až když chyba trvá (3 pokusy po sobě) – ne hned po startu nebo probuzení Macu
+  if [ "$1" = error ]; then
+    streak=$(( $(cat "$CDIR/errors" 2>/dev/null || echo 0) + 1 ))
+    echo "$streak" > "$CDIR/errors"
+    [ "$streak" -eq 3 ] && notify "Synchronizace „$LABEL“ nefunguje" "$2"
+  else
+    [ "$(cat "$CDIR/errors" 2>/dev/null || echo 0)" -ge 3 ] && [ "$1" = ok ] && notify "Synchronizace „$LABEL“" "Zase vše v pořádku."
+    rm -f "$CDIR/errors"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+#  Štítek „Čeká na nahrání“ u souborů, které ještě nejsou na serveru
+#  (když nejde internet nebo sync hlásí chybu). Po úspěšné synchronizaci zmizí.
+# ----------------------------------------------------------------------------
+TAG_BIN="$HOME/.local/bin/sftpdrive-tag"
+
+mark_pending() {
+  [ -x "$TAG_BIN" ] && [ -f "$CDIR/last_ok" ] && [ -d "$OFFLINE_DIR" ] || return 0
+  local list
+  # -cnewer: zachytí i soubory nakopírované se starým datem změny
+  list=$(find "$OFFLINE_DIR" \( -name .DS_Store -o -name "._*" -o -name "Icon?" \) -prune -o \
+         -type f -cnewer "$CDIR/last_ok" -print 2>/dev/null | head -n 5000)
+  [ -n "$list" ] || return 0
+  printf "%s\n" "$list" | "$TAG_BIN" add -
+  printf "%s\n" "$list" >> "$CDIR/pending"
+  sort -u "$CDIR/pending" -o "$CDIR/pending"
+}
+
+clear_pending() {
+  [ -f "$CDIR/pending" ] || return 0
+  [ -x "$TAG_BIN" ] && "$TAG_BIN" remove - < "$CDIR/pending"
+  rm -f "$CDIR/pending"
+}
+
+# ----------------------------------------------------------------------------
+#  Synchronizace (rclone bisync)
+# ----------------------------------------------------------------------------
+sync_once() { # [verbose] → 0 ok, 1 chyba, 2 server nedostupný (zámek musí být držen)
+  local verbose="${1:-}" rc before newlog args=""
+  if ! reachable; then
+    set_state offline "Server $HOST:$PORT je nedostupný – pracuješ offline"
+    return 2
+  fi
+  if [ ! -s "$RULES" ]; then
+    touch "$CDIR/last_ok"
+    set_state ok "Nic není vybráno jako offline"
+    return 0
+  fi
+  if [ ! -d "$OFFLINE_DIR" ]; then
+    # Offline složka zmizela → nic nemažeme na serveru, jen ji znovu stáhneme.
+    mkdir -p "$OFFLINE_DIR"
+    touch "$NEEDS_RESYNC"
+  fi
+  mkdir -p "$WORKDIR" "$LOG_ROOT"
+  write_filters
+  [ -f "$NEEDS_RESYNC" ] && args="--resync --resync-mode newer"
+  rotate_log "$LOG_SYNC"
+  before=$(stat -f %z "$LOG_SYNC" 2>/dev/null || echo 0)
+  rclone_env 2>/dev/null || { set_state error "Chybí heslo v Klíčence – spusť: sftpdrive password $NAME"; return 1; }
+  # shellcheck disable=SC2086
+  rclone bisync "$OFFLINE_DIR" "$REMOTE" $args \
+    --filters-file "$FILTERS" \
+    --workdir "$WORKDIR" \
+    --create-empty-src-dirs \
+    --compare size,modtime \
+    --resilient --recover --max-lock 2m \
+    --conflict-resolve newer --conflict-loser num --conflict-suffix konflikt --suffix-keep-extension \
+    --contimeout 15s --timeout 10m \
+    --log-file "$LOG_SYNC" --log-level INFO --stats 0
+  rc=$?
+  newlog=$(tail -c +"$((before + 1))" "$LOG_SYNC" 2>/dev/null)
+  if [ -n "$verbose" ]; then
+    printf '%s\n' "$newlog" | grep -E "Copied|Deleted|Moved|konflikt|ERROR|Bisync successful|critical" \
+      | sed -E 's/^[0-9\/]+ [0-9:]+ //' | tail -n 40
+  fi
+  if printf '%s' "$newlog" | grep -q "\.konflikt[0-9]"; then
+    notify "Konflikt v '$NAME'" "Soubor se změnil na obou stranách – starší verze uložena jako *.konflikt1"
+  fi
+  if [ $rc -eq 0 ]; then
+    rm -f "$NEEDS_RESYNC"
+    clear_pending            # nejdřív štítky pryč, pak čas synchronizace
+    touch "$CDIR/last_ok"   # čas poslední úspěšné synchronizace (pro ikonky ve Finderu)
+    set_state ok "Synchronizováno"
+    return 0
+  fi
+  if printf '%s' "$newlog" | grep -qi "must run --resync"; then
+    touch "$NEEDS_RESYNC"   # příště se srovná bezpečným sloučením (nic se nemaže)
+  fi
+  set_state error "$(printf '%s\n' "$newlog" | grep -E "ERROR|critical" | tail -n 1 | sed -E 's/^[0-9\/]+ [0-9:]+ //' | cut -c1-200)"
+  return 1
+}
+
+sync_cycle() { # jeden běh démona: sync + automatické "offline" pro nové lokální položky
+  local new rel changed=0
+  OFFLINE_NOW=0
+  sync_once
+  case $? in
+    0) ;;
+    2) OFFLINE_NOW=1; mark_pending; return 0 ;;
+    *) mark_pending ;;
+  esac
+  [ -d "$OFFLINE_DIR" ] || return 0
+  new=$(find_new_local /)
+  if [ -n "$new" ]; then
+    while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      rule_pin "$rel"; changed=1
+      echo "$(date '+%Y/%m/%d %H:%M:%S') NOTICE: nová lokální položka → offline: $rel" >> "$LOG_SYNC"
+    done <<EOF
+$new
+EOF
+    if [ $changed = 1 ]; then touch "$NEEDS_RESYNC"; sync_once; fi
+  fi
+}
+
+wait_for_change() { # sekundy – čeká na změnu v offline složce nebo timeout
+  local secs="$1" fpid i=0
+  if command -v fswatch >/dev/null 2>&1 && [ -d "$OFFLINE_DIR" ]; then
+    fswatch -1 -r --latency 3 -e '\.DS_Store$' -e '/\._[^/]*$' "$OFFLINE_DIR" >/dev/null 2>&1 &
+    fpid=$!
+    while kill -0 "$fpid" 2>/dev/null && [ "$i" -lt "$secs" ]; do sleep 1; i=$((i + 1)); done
+    kill "$fpid" 2>/dev/null; wait "$fpid" 2>/dev/null
+    [ "$i" -lt "$secs" ] && sleep 2   # krátké zdržení, ať se soubor stihne dopsat
+  else
+    sleep "$secs"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+#  LaunchAgenty (běh na pozadí po přihlášení)
+# ----------------------------------------------------------------------------
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+write_agent() { # label podpříkaz keepalive_xml log
+  local f="$AGENT_DIR/$1.plist"
+  mkdir -p "$AGENT_DIR" "$LOG_ROOT"
+  cat > "$f" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$1</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(xml_escape "$INSTALL_BIN")</string>
+    <string>$2</string>
+    <string>$NAME</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>$3
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>$(xml_escape "$4")</string>
+  <key>StandardErrorPath</key><string>$(xml_escape "$4")</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>$AGENT_PATH</string></dict>
+</dict>
+</plist>
+EOF
+}
+
+agents_write() {
+  write_agent "$LABEL_SYNC" _daemon "<true/>" "$LOG_ROOT/$NAME-agent.log"
+  if [ "$MOUNT_ENABLED" = 1 ]; then
+    # Při chybě (např. bez internetu) zkoušet znovu; po ručním vysunutí nechat být.
+    write_agent "$LABEL_MOUNT" _mount "<dict><key>SuccessfulExit</key><false/></dict>" "$LOG_ROOT/$NAME-agent.log"
+  else
+    agent_loaded "$LABEL_MOUNT" && launchctl bootout "gui/$(id -u)/$LABEL_MOUNT" 2>/dev/null
+    rm -f "$AGENT_DIR/$LABEL_MOUNT.plist"
+  fi
+}
+
+agent_loaded() { launchctl print "gui/$(id -u)/$1" >/dev/null 2>&1; }
+
+agents_start() {
+  local l i
+  agents_write
+  for l in "$LABEL_SYNC" "$LABEL_MOUNT"; do
+    [ -f "$AGENT_DIR/$l.plist" ] || continue
+    agent_loaded "$l" && launchctl bootout "gui/$(id -u)/$l" 2>/dev/null
+    for i in 1 2 3 4 5; do
+      launchctl bootstrap "gui/$(id -u)" "$AGENT_DIR/$l.plist" 2>/dev/null && break
+      sleep 1
+    done
+  done
+}
+
+agents_stop() {
+  local l i
+  for l in "$LABEL_SYNC" "$LABEL_MOUNT"; do
+    agent_loaded "$l" && launchctl bootout "gui/$(id -u)/$l" 2>/dev/null
+  done
+  if [ "$MOUNT_ENABLED" = 1 ]; then
+    for i in 1 2 3 4 5 6 7 8 9 10; do is_mounted || break; sleep 0.5; done
+    is_mounted && { umount "$MOUNT_DIR" 2>/dev/null || umount -f "$MOUNT_DIR" 2>/dev/null; }
+  fi
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+#  Staré Rychlé akce (verze 1.x) – jen jejich názvy, aby je šlo smazat
+# ----------------------------------------------------------------------------
+QA_PIN="SFTP – Ponechat offline"
+QA_UNPIN="SFTP – Uvolnit místo"
+QA_OPEN="SFTP – Zobrazit v druhé složce"
+
+# ----------------------------------------------------------------------------
+#  Příkazy
+# ----------------------------------------------------------------------------
+cmd_install() { # nainstaluje skript do ~/.local/bin + rychlé akce
+  local self
+  self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+  mkdir -p "$(dirname "$INSTALL_BIN")"
+  if [ "$self" != "$INSTALL_BIN" ]; then
+    cp -f "$self" "$INSTALL_BIN"
+  fi
+  chmod +x "$INSTALL_BIN"
+  # pomocník pro štítky (je vedle skriptu v aplikaci)
+  if [ -f "$(dirname "$self")/sftpdrive-tag" ] && [ "$(dirname "$self")/sftpdrive-tag" != "$TAG_BIN" ]; then
+    cp -f "$(dirname "$self")/sftpdrive-tag" "$TAG_BIN" && chmod +x "$TAG_BIN"
+    xattr -d com.apple.quarantine "$TAG_BIN" 2>/dev/null
+  fi
+  # stažený soubor (AirDrop/web) má "karanténu" → launchd by ho nemusel spustit
+  xattr -d com.apple.quarantine "$INSTALL_BIN" 2>/dev/null
+  command -v rclone >/dev/null 2>&1 || install_rclone
+  # staré Rychlé akce (nahradilo je menu pravého tlačítka z aplikace)
+  rm -rf "$SERVICES_DIR/$QA_PIN.workflow" "$SERVICES_DIR/$QA_UNPIN.workflow" "$SERVICES_DIR/$QA_OPEN.workflow"
+  /System/Library/CoreServices/pbs -update >/dev/null 2>&1
+  # běžící připojení přepnout na novou verzi skriptu
+  local n
+  for n in $(list_conns); do
+    load_conn "$n"
+    agent_loaded "$LABEL_SYNC" && launchctl kickstart -k "gui/$(id -u)/$LABEL_SYNC" >/dev/null 2>&1
+  done
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *)
+      if [ -t 0 ] && ask_yn "Přidat ~/.local/bin do PATH (~/.zprofile), aby šel příkaz 'sftpdrive' psát v Terminálu?" a; then
+        printf '\n# sftpdrive\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.zprofile"
+        ok "Přidáno do ~/.zprofile (projeví se v novém okně Terminálu)."
+      fi ;;
+  esac
+  ok "Nainstalováno: $(pretty "$INSTALL_BIN") + Rychlé akce ve Finderu"
+}
+
+cmd_setup() {
+  local name="" host="" port="" suser="" rpath="" auth="" keyfile="" pass="" keypass=""
+  local mount_en="" all_off="" cache_gb="" interval="" yes=0 pw_stdin=0 start=1 proto="" nocert=0 expect_fp="" label=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --proto) proto="$2"; shift ;;
+      --label) label="$2"; shift ;;
+      --choose) all_off=0 ;;
+      --no-check-cert) nocert=1 ;;
+      --expect-fp) expect_fp="$2"; shift ;;
+      --name) name="$2"; shift ;;
+      --host) host="$2"; shift ;;
+      --port) port="$2"; shift ;;
+      --user) suser="$2"; shift ;;
+      --path) rpath="$2"; shift ;;
+      --key) keyfile="$2"; auth=key; shift ;;
+      --password-stdin) pw_stdin=1; auth=password ;;
+      --no-mount) mount_en=0 ;;
+      --mount) mount_en=1 ;;
+      --all-offline) all_off=1 ;;
+      --cache-gb) cache_gb="$2"; shift ;;
+      --interval) interval="$2"; shift ;;
+      --yes|-y) yes=1 ;;
+      --no-start) start=0 ;;
+      *) die "Neznámý parametr: $1" ;;
+    esac
+    shift
+  done
+
+  need_rclone
+  echo
+  echo "${C_B}SFTP Drive – nové připojení${C_OFF}"
+  echo "${C_DIM}Server bude ve Finderu jako složka v ~/SFTP Drive. Heslo se uloží do Klíčenky.${C_OFF}"
+  echo
+
+  # Název složky ve Finderu (smí mít mezery i diakritiku) + interní název připojení (bez nich)
+  if [ -z "$label" ]; then
+    if [ $yes = 1 ]; then label="$name"; else ask "Název složky ve Finderu (např. Škola)" "${name:-Server}"; label="$REPLY"; fi
+  fi
+  label=$(nfc "$(printf '%s' "$label" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')")
+  case "$label" in ''|*/*|.*) die "Název složky nesmí být prázdný, začínat tečkou ani obsahovat „/“." ;; esac
+  if [ -z "$name" ]; then
+    name=$(printf "%s" "$label" | iconv -f UTF-8 -t UTF-8-MAC 2>/dev/null | LC_ALL=C tr -d "\200-\377" | LC_ALL=C tr -c "A-Za-z0-9_-" "-" \
+           | sed -e 's/--*/-/g' -e 's/^-//' -e 's/-$//' | cut -c1-40)
+    [ -n "$name" ] || name=server
+    local base_name="$name" i=2
+    while [ -f "$CONF_ROOT/$name/config" ]; do name="$base_name-$i"; i=$((i + 1)); done
+  fi
+  case "$name" in ''|*[!A-Za-z0-9_-]*) die "Interní název smí obsahovat jen písmena bez diakritiky, čísla, - a _." ;; esac
+  [ -f "$CONF_ROOT/$name/config" ] && die "Připojení '$name' už existuje (sftpdrive remove $name)."
+
+  if [ -z "$proto" ]; then
+    if [ $yes = 1 ]; then proto=sftp
+    else
+      echo "Protokol:  1) SFTP (přes SSH, port 22)   2) FTP (port 21)   3) FTPS (FTP se šifrováním TLS)"
+      ask "Volba" "1"
+      case "$REPLY" in 2) proto=ftp ;; 3) proto=ftps ;; *) proto=sftp ;; esac
+    fi
+  fi
+  case "$proto" in sftp|ftp|ftps) ;; *) die "Neznámý protokol '$proto' (sftp, ftp, ftps)." ;; esac
+  local defport=22; [ "$proto" != sftp ] && defport=21
+
+  [ -z "$host" ] && { [ $yes = 1 ] && die "Chybí --host"; ask "Adresa serveru (host nebo IP)"; host="$REPLY"; }
+  # povolit i zápis typu sftp://server:2222/cesta
+  case "$host" in *://*) host="${host#*://}" ;; esac
+  case "$host" in */*) [ -z "$rpath" ] && rpath="/${host#*/}"; host="${host%%/*}" ;; esac
+  case "$host" in *:*) [ -z "$port" ] && port="${host##*:}"; host="${host%:*}" ;; esac
+  [ -n "$host" ] || die "Adresa serveru je povinná."
+  [ -z "$port" ] && { if [ $yes = 1 ]; then port=$defport; else ask "Port" "$defport"; port="$REPLY"; fi; }
+  case "$port" in ''|*[!0-9]*) die "Port musí být číslo." ;; esac
+  [ -z "$suser" ] && { [ $yes = 1 ] && die "Chybí --user"; ask "Uživatelské jméno"; suser="$REPLY"; }
+  [ -n "$suser" ] || die "Uživatel je povinný."
+
+  [ "$proto" != sftp ] && { [ "$auth" = key ] && die "SSH klíč jde použít jen u SFTP."; auth=password; }
+  if [ -z "$auth" ]; then
+    local defkey=""
+    for k in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ecdsa"; do [ -f "$k" ] && { defkey="$k"; break; }; done
+    echo "Přihlášení:  1) heslem   2) SSH klíčem${defkey:+ ($(pretty "$defkey"))}"
+    ask "Volba" "1"
+    if [ "$REPLY" = 2 ]; then
+      auth=key
+      ask "Cesta k privátnímu klíči" "${defkey:-$HOME/.ssh/id_ed25519}"; keyfile="$REPLY"
+    else
+      auth=password
+    fi
+  fi
+
+  if [ "$auth" = key ]; then
+    keyfile="${keyfile/#\~/$HOME}"
+    [ -f "$keyfile" ] || die "Klíč '$keyfile' neexistuje."
+    if ! ssh-keygen -y -P "" -f "$keyfile" >/dev/null 2>&1; then
+      read -r -s -p "Heslo (passphrase) ke klíči: " keypass; echo
+    fi
+  else
+    if [ $pw_stdin = 1 ]; then
+      IFS= read -r pass
+    else
+      read -r -s -p "Heslo: " pass; echo
+    fi
+    [ -n "$pass" ] || die "Heslo je prázdné."
+  fi
+
+  [ -z "$rpath" ] && [ $yes != 1 ] && { ask "Složka na serveru (prázdné = domovská, např. /var/www)" ""; rpath="$REPLY"; }
+  rpath="${rpath%/}"
+
+  # --- připravit konfiguraci ---
+  NAME="$name"; SUSER="$suser"; HOST="$host"
+  local cdir="$CONF_ROOT/$name" tmpd
+  tmpd=$(mktemp -d)
+  trap 'rm -rf "$tmpd"' EXIT
+
+  # --- ověření klíče serveru (ochrana proti podvrženému serveru) ---
+  echo
+  if [ "$proto" = sftp ]; then
+  echo "Načítám otisk klíče serveru…"
+  ssh-keyscan -p "$port" -T 10 "$host" 2>/dev/null | grep -v '^#' > "$tmpd/known_hosts"
+  [ -s "$tmpd/known_hosts" ] || die "Server $host:$port neodpovídá (špatná adresa/port, firewall?)."
+  ssh-keygen -lf "$tmpd/known_hosts" | sed 's/^/   /'
+  if [ -n "$expect_fp" ] && ! ssh-keygen -lf "$tmpd/known_hosts" | grep -qF "$expect_fp"; then
+    die "Klíč serveru se mezitím změnil – připojení zrušeno."
+  fi
+  if [ $yes != 1 ]; then
+    ask_yn "Je to opravdu tvůj server? (při prvním připojení obvykle stačí potvrdit)" a || die "Zrušeno."
+  fi
+  else
+    nc -z -G 10 "$host" "$port" >/dev/null 2>&1 || die "Server $host:$port neodpovídá (špatná adresa/port, firewall?)."
+    : > "$tmpd/known_hosts"
+  fi
+
+  if [ "$proto" = sftp ]; then
+    cat > "$tmpd/rclone.conf" <<EOF
+[remote]
+type = sftp
+host = $host
+port = $port
+user = $suser
+known_hosts_file = $cdir/known_hosts
+EOF
+    [ "$auth" = key ] && echo "key_file = $keyfile" >> "$tmpd/rclone.conf"
+  else
+    cat > "$tmpd/rclone.conf" <<EOF
+[remote]
+type = ftp
+host = $host
+port = $port
+user = $suser
+EOF
+    [ "$proto" = ftps ] && echo "explicit_tls = true" >> "$tmpd/rclone.conf"
+    [ "$nocert" = 1 ] && echo "no_check_certificate = true" >> "$tmpd/rclone.conf"
+  fi
+
+  # --- test připojení ---
+  echo "Zkouším se přihlásit…"
+  mkdir -p "$cdir"
+  cp "$tmpd/known_hosts" "$cdir/known_hosts"
+  export RCLONE_CONFIG="$tmpd/rclone.conf"
+  unset RCLONE_SFTP_PASS RCLONE_SFTP_KEY_FILE_PASS RCLONE_FTP_PASS
+  if [ -n "$pass" ]; then
+    if [ "$proto" = sftp ]; then
+      RCLONE_SFTP_PASS=$(printf '%s' "$pass" | rclone obscure -); export RCLONE_SFTP_PASS
+    else
+      RCLONE_FTP_PASS=$(printf '%s' "$pass" | rclone obscure -); export RCLONE_FTP_PASS
+    fi
+  fi
+  [ -n "$keypass" ] && { RCLONE_SFTP_KEY_FILE_PASS=$(printf '%s' "$keypass" | rclone obscure -); export RCLONE_SFTP_KEY_FILE_PASS; }
+  local out
+  if ! out=$(rclone lsf "remote:$rpath" --max-depth 1 --contimeout 15s --low-level-retries 1 --retries 1 2>&1); then
+    if printf '%s' "$out" | grep -qi "directory not found"; then
+      if [ $yes = 1 ] || ask_yn "Složka '$rpath' na serveru neexistuje. Vytvořit?" a; then
+        rclone mkdir "remote:$rpath" --contimeout 15s || { rm -rf "$cdir"; die "Nepodařilo se vytvořit složku."; }
+        out=""
+      else
+        rm -rf "$cdir"; die "Zrušeno."
+      fi
+    else
+      rm -rf "$cdir"
+      printf '%s\n' "$out" | grep -E "ERROR|Failed|failed" | tail -n 3 >&2
+      die "Přihlášení se nepovedlo (zkontroluj jméno a heslo/klíč)."
+    fi
+  fi
+  ok "Přihlášení funguje (položek ve složce: $(printf '%s' "$out" | grep -c .))."
+
+  # --- volby ---
+  # Síťový disk (online složka) jen na výslovné přání (--mount): při výpadku internetu
+  # macOS hlásí přerušené spojení a nabízí vysunutí. Výchozí je obyčejná složka na disku.
+  [ -z "$mount_en" ] && mount_en=0
+  if [ -z "$all_off" ]; then
+    if [ $yes = 1 ]; then all_off=1
+    else
+      echo
+      if ask_yn "Synchronizovat celý server? (jinak si složky vybereš v aplikaci)" a; then all_off=1; else all_off=0; fi
+    fi
+  fi
+  [ -z "$cache_gb" ] && cache_gb=10
+  [ -z "$interval" ] && interval=60
+
+  local mdir="" odir="$DRIVE_ROOT/$label"
+  [ "$mount_en" = 1 ] && mdir="$DRIVE_ROOT/$label (online)"
+  if [ -d "$odir" ] && ! only_junk_in "$odir"; then
+    rm -rf "$cdir"
+    die "Složka „$(pretty "$odir")“ už existuje a není prázdná – zvol jiný název."
+  fi
+
+  # --- uložit ---
+  mv -f "$tmpd/rclone.conf" "$cdir/rclone.conf"
+  {
+    printf 'LABEL=%q\n' "$label"
+    printf 'PROTO=%q\n' "$proto"
+    printf 'HOST=%q\n' "$host"
+    printf 'PORT=%q\n' "$port"
+    printf 'SUSER=%q\n' "$suser"
+    printf 'REMOTE_PATH=%q\n' "$rpath"
+    printf 'AUTH=%q\n' "$auth"
+    printf 'KEY_FILE=%q\n' "$keyfile"
+    printf 'MOUNT_ENABLED=%q\n' "$mount_en"
+    printf 'MOUNT_DIR=%q\n' "$mdir"
+    printf 'OFFLINE_DIR=%q\n' "$odir"
+    printf 'CACHE_GB=%q\n' "$cache_gb"
+    printf 'INTERVAL=%q\n' "$interval"
+  } > "$cdir/config"
+  chmod 700 "$cdir"; chmod 600 "$cdir"/*
+  load_conn "$name"
+  [ -n "$pass" ] && kc_set pass "$pass"
+  [ -n "$keypass" ] && kc_set keypass "$keypass"
+  pass=""; keypass=""
+  : > "$RULES"
+  [ "$all_off" = 1 ] && echo "+ /" > "$RULES"
+  touch "$NEEDS_RESYNC"
+  mkdir -p "$OFFLINE_DIR" "$LOG_ROOT"
+  [ "$mount_en" = 1 ] && mkdir -p "$MOUNT_DIR"
+
+  cmd_install >/dev/null
+  load_conn "$name"      # cmd_install prochází všechna připojení – vrátit se k tomu novému
+  if [ $start = 1 ]; then
+    agents_start
+  fi
+
+  echo
+  ok "Hotovo! Server je ve Finderu jako složka „${C_B}$label${C_OFF}“ a synchronizuje se na pozadí."
+  echo
+  echo "   Složka:  $(pretty "$OFFLINE_DIR")"
+  [ "$mount_en" = 1 ] && echo "   Online (síťový disk):  $(pretty "$MOUNT_DIR")"
+  echo "   Co do ní nakopíruješ, nahraje se na server; změny ze serveru se stáhnou samy."
+  echo "   Funguje i bez internetu – změny se nahrají, až bude spojení."
+  echo
+  echo "   Tip: vyber ve Finderu složku „SFTP Drive“ a stiskni ⌃⌘T – bude v postranním panelu."
+  echo "   Stav: sftpdrive status    Log: sftpdrive log"
+  if [ $start = 1 ] && [ $yes != 1 ]; then open "$DRIVE_ROOT" 2>/dev/null; fi
+}
+
+map_path() { # absolutní/relativní cesta → MP_NAME, MP_REL, MP_SIDE (online|offline)
+  local p="$1" n base side
+  case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+  while [ "${p%/}" != "$p" ] && [ "$p" != "/" ]; do p="${p%/}"; done
+  p=$(nfc "$p")
+  for n in $(list_conns); do
+    load_conn "$n"
+    for side in online offline; do
+      if [ $side = online ]; then base="$MOUNT_DIR"; else base="$OFFLINE_DIR"; fi
+      [ -n "$base" ] || continue
+      base=$(nfc "$base")
+      if [ "$p" = "$base" ]; then MP_NAME=$n; MP_REL=/; MP_SIDE=$side; return 0; fi
+      case "$p" in "$base"/*) MP_NAME=$n; MP_REL="/${p#"$base"/}"; MP_SIDE=$side; return 0 ;; esac
+    done
+  done
+  return 1
+}
+
+parse_gui() { # zpracuje --gui a vrátí zbytek v PARGS
+  PARGS=()
+  local a
+  for a in "$@"; do
+    case "$a" in --gui) GUI=1 ;; *) PARGS+=("$a") ;; esac
+  done
+}
+
+cmd_pin() {
+  parse_gui "$@"
+  [ ${#PARGS[@]} -gt 0 ] || die "Použití: sftpdrive pin <cesta>…  (složka/soubor v ~/SFTP/…)"
+  need_rclone
+  local p names="" n added=0 label=""
+  # 1) přiřadit cesty k připojením
+  local -a rels=() conns=()
+  for p in "${PARGS[@]}"; do
+    map_path "$p" || die "'$(pretty "$p")' není ve složce SFTP Drive (~/SFTP/…)."
+    rels+=("$MP_REL"); conns+=("$MP_NAME")
+    label="${label:+$label, }${MP_REL##*/}"
+  done
+  [ "$label" = "" ] && label="celý server"
+  for n in $(printf '%s\n' "${conns[@]}" | sort -u); do
+    load_conn "$n"
+    [ "$GUI" = 1 ] && notify "Ponechat offline" "Stahuji: $label…"
+    lock_acquire || die "Synchronizace je zaneprázdněná, zkus to za chvíli."
+    reachable || die "Server $HOST je nedostupný – offline teď nastavit nejde."
+    [ -f "$NEEDS_RESYNC" ] || sync_once >/dev/null   # nejdřív odeslat rozpracované změny
+    local i
+    for i in "${!rels[@]}"; do
+      [ "${conns[$i]}" = "$n" ] || continue
+      if is_pinned "${rels[$i]}" && ! rules_under "${rels[$i]}" -; then
+        [ "$GUI" = 1 ] || echo "Už je offline: ${rels[$i]}"
+      else
+        rule_pin "${rels[$i]}"; added=1
+        [ "$GUI" = 1 ] || echo "Offline: ${rels[$i]}"
+      fi
+    done
+    if [ $added = 1 ]; then
+      touch "$NEEDS_RESYNC"
+      [ "$GUI" = 1 ] || echo "Stahuji…"
+      if sync_once verbose; then
+        say "Synchronizuje se: $label" "Hotovo"
+      else
+        die "Stahování se nepovedlo – zkusím to znovu automaticky. Detaily: sftpdrive log"
+      fi
+    else
+      say "Už se synchronizuje: $label" "Hotovo"
+    fi
+    lock_release
+  done
+}
+
+cmd_unpin() {
+  parse_gui "$@"
+  [ ${#PARGS[@]} -gt 0 ] || die "Použití: sftpdrive unpin <cesta>…"
+  need_rclone
+  local p n label="" i rel L R rc
+  local -a rels=() conns=()
+  for p in "${PARGS[@]}"; do
+    map_path "$p" || die "'$(pretty "$p")' není ve složce SFTP Drive (~/SFTP/…)."
+    rels+=("$MP_REL"); conns+=("$MP_NAME")
+    label="${label:+$label, }${MP_REL##*/}"
+  done
+  [ "$label" = "" ] && label="celý server"
+  for n in $(printf '%s\n' "${conns[@]}" | sort -u); do
+    load_conn "$n"
+    lock_acquire || die "Synchronizace je zaneprázdněná, zkus to za chvíli."
+    # 1) Nejdřív vše odeslat na server – bez toho nic nemažeme.
+    sync_once >/dev/null
+    rc=$?
+    [ $rc -eq 2 ] && die "Server je nedostupný – místo teď uvolnit nejde (neodeslané změny by se ztratily)."
+    [ $rc -ne 0 ] && die "Synchronizace hlásí chybu – místo neuvolňuji, aby se nic neztratilo. Detaily: sftpdrive log"
+    for i in "${!rels[@]}"; do
+      [ "${conns[$i]}" = "$n" ] || continue
+      rel="${rels[$i]}"
+      if ! is_pinned "$rel" && ! rules_under "$rel" +; then
+        [ "$GUI" = 1 ] || echo "Není offline: $rel"
+        continue
+      fi
+      L=$(local_join "$OFFLINE_DIR" "$rel"); R=$(remote_join "$rel")
+      # 2) Ověřit, že místní kopie je na serveru celá a stejná.
+      if [ -e "$L" ]; then
+        rclone_env || die "Chybí heslo v Klíčence."
+        if ! rclone check "$L" "$R" --one-way --contimeout 15s \
+              --exclude .DS_Store --exclude "._*" --exclude .localized \
+              --exclude ".~lock.*#" --exclude "~\$*" >/dev/null 2>&1; then
+          die "„$rel“ není na serveru stejné jako na disku – místní kopii nemažu. Zkus: sftpdrive sync"
+        fi
+      fi
+      rule_unpin "$rel"
+      touch "$NEEDS_RESYNC"
+      # 3) Smazat místní kopii (je mimo synchronizaci, na serveru zůstane).
+      if [ "$rel" = "/" ]; then
+        find "$OFFLINE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+      else
+        rm -rf "$L"
+        # uklidit prázdné nadřazené složky, které už nic offline neobsahují
+        local parent="${rel%/*}"
+        while [ -n "$parent" ] && ! is_pinned "$parent" && ! rules_under "$parent" +; do
+          rmdir "$OFFLINE_DIR$parent" 2>/dev/null || break
+          parent="${parent%/*}"
+        done
+      fi
+      [ "$GUI" = 1 ] || echo "Uvolněno: $rel"
+    done
+    sync_once >/dev/null
+    lock_release
+    say "$label se už nesynchronizuje a místo je uvolněné. Na serveru zůstává – vrátíš to v menu SFTP Drive → Vybrat složky." "Uvolněno místo"
+  done
+}
+
+cmd_reveal() { # otevře stejnou položku ve "druhé" složce (online ↔ offline)
+  parse_gui "$@"
+  [ ${#PARGS[@]} -gt 0 ] || die "Použití: sftpdrive reveal <cesta>"
+  map_path "${PARGS[0]}" || die "Položka není ve složce SFTP Drive (~/SFTP/…)."
+  load_conn "$MP_NAME"
+  local target
+  if [ "$MP_SIDE" = online ]; then target=$(local_join "$OFFLINE_DIR" "$MP_REL")
+  else
+    [ -n "$MOUNT_DIR" ] || die "Online složka je u '$NAME' vypnutá."
+    target=$(local_join "$MOUNT_DIR" "$MP_REL")
+  fi
+  if [ -e "$target" ]; then open -R "$target"
+  else die "V ${MP_SIDE/online/offline}${MP_SIDE/offline/online} složce to není (položka není offline?)."; fi
+}
+
+cmd_sync() {
+  local name force=0
+  [ "${1:-}" = "--resync" ] && { force=1; shift; }
+  name=$(resolve_name "${1:-}") || exit 1
+  load_conn "$name"; need_rclone
+  lock_acquire 600 || die "Synchronizace už běží."
+  [ $force = 1 ] && touch "$NEEDS_RESYNC"
+  echo "Synchronizuji '$NAME'…"
+  sync_once verbose
+  case $? in
+    0) ok "Hotovo." ;;
+    2) die "Server $HOST:$PORT je nedostupný." ;;
+    *) die "Synchronizace selhala – viz: sftpdrive log $NAME" ;;
+  esac
+}
+
+cmd_status() {
+  local names n st t msg
+  if [ -n "${1:-}" ]; then names=$(resolve_name "$1") || exit 1; else names=$(list_conns); fi
+  [ -n "$names" ] || { echo "Žádné připojení. Spusť: sftpdrive setup"; return; }
+  for n in $names; do
+    load_conn "$n"
+    echo
+    echo "${C_B}● $LABEL${C_OFF} ($NAME)  ${C_DIM}${PROTO:-sftp}://$SUSER@$HOST:$PORT${REMOTE_PATH:+ $REMOTE_PATH}${C_OFF}"
+    if [ "$MOUNT_ENABLED" = 1 ]; then
+      if is_mounted; then st="${C_GRN}připojeno${C_OFF}"; else st="${C_YEL}nepřipojeno${C_OFF}"; fi
+      echo "  Online:   $(pretty "$MOUNT_DIR")  – $st"
+    fi
+    echo "  Složka:   $(pretty "$OFFLINE_DIR")  – $(du -sh "$OFFLINE_DIR" 2>/dev/null | cut -f1 | tr -d ' ') na disku"
+    if [ -f "$STATE" ]; then
+      IFS='|' read -r st t msg < "$STATE"
+      case "$st" in
+        ok) st="${C_GRN}OK${C_OFF}" ;; offline) st="${C_YEL}offline${C_OFF}" ;; *) st="${C_RED}CHYBA${C_OFF}" ;;
+      esac
+      echo "  Poslední synchronizace: $t – $st ${C_DIM}$msg${C_OFF}"
+    fi
+    if agent_loaded "$LABEL_SYNC"; then echo "  Služba na pozadí: ${C_GRN}běží${C_OFF}"
+    else echo "  Služba na pozadí: ${C_YEL}zastavena${C_OFF} (sftpdrive start $NAME)"; fi
+    if [ -s "$RULES" ]; then
+      echo "  Offline položky:"
+      sed -e 's/^+ /    ✔ /' -e 's/^- /    ✖ (výjimka) /' "$RULES"
+    else
+      echo "  Offline položky: ${C_DIM}zatím žádné${C_OFF}"
+    fi
+  done
+  echo
+}
+
+cmd_start() {
+  local n; n=$(resolve_name "${1:-}") || exit 1; load_conn "$n"
+  rm -f "$CDIR/paused"
+  agents_start
+  agent_loaded "$LABEL_SYNC" || die "Synchronizaci se nepodařilo spustit – povol „sftpdrive“ v Nastavení systému → Obecné → Položky při přihlášení a rozšíření."
+  ok "Spuštěno: $n"
+}
+cmd_stop() {  # ručně pozastaveno – aplikace pak synchronizaci sama nespouští
+  local n; n=$(resolve_name "${1:-}") || exit 1; load_conn "$n"
+  touch "$CDIR/paused"
+  agents_stop
+  ok "Pozastaveno: $n"
+}
+
+cmd_open() {
+  local n; n=$(resolve_name "${1:-}") || exit 1; load_conn "$n"
+  [ "$MOUNT_ENABLED" = 1 ] && open "$MOUNT_DIR"
+  open "$OFFLINE_DIR"
+}
+
+cmd_log() {
+  local n; n=$(resolve_name "${1:-}") || exit 1; load_conn "$n"
+  echo "${C_DIM}$(pretty "$LOG_SYNC")  (Ctrl+C ukončí)${C_OFF}"
+  tail -n 40 -F "$LOG_SYNC" "$LOG_MOUNT" 2>/dev/null
+}
+
+cmd_password() {
+  local n pw; n=$(resolve_name "${1:-}") || exit 1; load_conn "$n"
+  if [ "$AUTH" = password ]; then
+    read -r -s -p "Nové heslo pro $SUSER@$HOST: " pw; echo
+    [ -n "$pw" ] || die "Prázdné heslo."
+    kc_set pass "$pw"
+  else
+    read -r -s -p "Passphrase ke klíči $(pretty "$KEY_FILE") (prázdné = žádná): " pw; echo
+    if [ -n "$pw" ]; then kc_set keypass "$pw"; else kc_del keypass; fi
+  fi
+  ok "Uloženo do Klíčenky."
+  agents_start
+}
+
+cmd_remove() {
+  local n del=0
+  [ "${1:-}" = "--delete-local" ] && { del=1; shift; }
+  n=$(resolve_name "${1:-}") || exit 1; load_conn "$n"
+  [ -t 0 ] && { ask_yn "Opravdu odebrat připojení '$n'? (data na serveru zůstanou)" n || exit 0; }
+  agents_stop
+  rm -f "$AGENT_DIR/$LABEL_SYNC.plist" "$AGENT_DIR/$LABEL_MOUNT.plist"
+  clear_pending
+  kc_del pass; kc_del keypass
+  rm -rf "$CACHE_DIR"
+  [ "$MOUNT_ENABLED" = 1 ] && rmdir "$MOUNT_DIR" 2>/dev/null
+  if [ -d "$OFFLINE_DIR" ]; then
+    if [ $del = 1 ] || { [ -t 0 ] && ask_yn "Smazat i místní offline kopii $(pretty "$OFFLINE_DIR")?" n; }; then
+      rm -rf "$OFFLINE_DIR"
+    else
+      echo "Offline kopie zůstává v $(pretty "$OFFLINE_DIR") (už se nesynchronizuje)."
+    fi
+  fi
+  rm -rf "$CDIR"
+  ok "Připojení '$n' odebráno."
+}
+
+cmd_uninstall() {
+  local n
+  for n in $(list_conns); do cmd_remove "$n"; done
+  rm -rf "$SERVICES_DIR/$QA_PIN.workflow" "$SERVICES_DIR/$QA_UNPIN.workflow" "$SERVICES_DIR/$QA_OPEN.workflow"
+  rm -f "$INSTALL_BIN"
+  rm -f "$TAG_BIN"
+  rm -rf "$LOG_ROOT" "$CACHE_ROOT"
+  rmdir "$CONF_ROOT" 2>/dev/null
+  # ~/SFTP smazat, jen když v ní zbyla jen ikona složky (Icon␍) a .DS_Store
+  if [ -d "$DRIVE_ROOT" ] && only_junk_in "$DRIVE_ROOT"; then
+    rm -rf "$DRIVE_ROOT"
+  fi
+  [ -z "${SFTPDRIVE_FROM_APP:-}" ] && pkill -f "SFTP Drive.app/Contents/MacOS/SFTPDrive" 2>/dev/null
+  launchctl bootout "gui/$(id -u)/$APP_ID.menubar" 2>/dev/null
+  rm -f "$AGENT_DIR/$APP_ID.menubar.plist"
+  ok "SFTP Drive odinstalován (rclone zůstal; odstraníš ho: brew uninstall rclone fswatch)."
+}
+
+# --- interní příkazy pro LaunchAgenty ---------------------------------------
+cmd__daemon() {
+  load_conn "$1"
+  need_rclone
+  mkdir -p "$LOG_ROOT"
+  echo "$(date '+%Y/%m/%d %H:%M:%S') NOTICE: démon spuštěn (interval ${INTERVAL}s)" >> "$LOG_SYNC"
+  while :; do
+    if lock_acquire 5; then
+      sync_cycle
+      lock_release
+    fi
+    # bez internetu zkoušet spojení častěji, ať se po obnovení hned dosynchronizuje
+    if [ "$OFFLINE_NOW" = 1 ]; then wait_for_change 10; else wait_for_change "${INTERVAL:-60}"; fi
+  done
+}
+
+cmd__mount() {
+  load_conn "$1"
+  [ "$MOUNT_ENABLED" = 1 ] || exit 0
+  need_rclone
+  mkdir -p "$LOG_ROOT" "$CACHE_DIR"
+  rotate_log "$LOG_MOUNT"
+  # po pádu může zůstat "mrtvé" připojení → odpojit
+  if is_mounted; then
+    umount "$MOUNT_DIR" 2>/dev/null || umount -f "$MOUNT_DIR" 2>/dev/null || diskutil unmount force "$MOUNT_DIR" >/dev/null 2>&1
+  fi
+  mkdir -p "$MOUNT_DIR"
+  if ! only_junk_in "$MOUNT_DIR"; then
+    notify "Online složka '$NAME'" "Složka $(pretty "$MOUNT_DIR") není prázdná – přesuň z ní soubory jinam."
+    echo "$(date '+%Y/%m/%d %H:%M:%S') ERROR: $MOUNT_DIR není prázdná" >> "$LOG_MOUNT"
+    exit 0
+  fi
+  if ! reachable; then
+    echo "$(date '+%Y/%m/%d %H:%M:%S') NOTICE: server nedostupný, zkusím znovu" >> "$LOG_MOUNT"
+    exit 1   # launchd to za 30 s zkusí znovu
+  fi
+  if ! rclone_env; then
+    notify "Online složka '$NAME'" "Chybí heslo v Klíčence – spusť: sftpdrive password $NAME"
+    exit 0
+  fi
+  exec rclone nfsmount "$REMOTE" "$MOUNT_DIR" \
+    --volname "$NAME" \
+    --vfs-cache-mode full \
+    --vfs-cache-max-size "${CACHE_GB:-10}G" \
+    --vfs-cache-max-age 720h \
+    --dir-cache-time 1m \
+    --cache-dir "$CACHE_DIR" \
+    --nfs-cache-type disk \
+    --contimeout 15s \
+    --log-file "$LOG_MOUNT" --log-level NOTICE
+}
+
+cmd_rename() { # název nový_název_složky
+  local n new newdir
+  n=$(resolve_name "${1:-}") || exit 1; load_conn "$n"
+  new=$(nfc "$(printf "%s" "${2:-}" | sed -e "s/^[[:space:]]*//" -e "s/[[:space:]]*\$//")")
+  case "$new" in ""|*/*|.*) die "Neplatný název složky." ;; esac
+  newdir="$(dirname "$OFFLINE_DIR")/$new"
+  [ "$newdir" = "$OFFLINE_DIR" ] && return 0
+  [ -e "$newdir" ] && die "Složka „$(pretty "$newdir")“ už existuje."
+  lock_acquire 600 || die "Synchronizace je zaneprázdněná, zkus to za chvíli."
+  agents_stop
+  if [ -d "$OFFLINE_DIR" ]; then mv "$OFFLINE_DIR" "$newdir" || die "Přejmenování se nepovedlo."; fi
+  conf_set OFFLINE_DIR "$newdir"
+  conf_set LABEL "$new"
+  touch "$NEEDS_RESYNC"   # nové umístění → bezpečné sloučení (nic se nemaže)
+  lock_release
+  load_conn "$n"
+  agents_start
+  say "Složka se teď jmenuje „$new“." "Přejmenováno"
+}
+
+conf_set() { # KLÍČ hodnota – přepíše řádek v config
+  local f="$CDIR/config" tmp
+  tmp=$(mktemp)
+  grep -v "^$1=" "$f" > "$tmp"
+  printf "%s=%q\n" "$1" "$2" >> "$tmp"
+  mv -f "$tmp" "$f"; chmod 600 "$f"
+}
+
+cmd__select() { # název --all | položka… – co z kořene serveru synchronizovat (okno „Vybrat složky“)
+  load_conn "$1"; shift
+  [ $# -gt 0 ] || die "Nic není vybráno."
+  lock_acquire 600 || die "Synchronizace je zaneprázdněná, zkus to za chvíli."
+  local rc e item rel removed="" line
+  # 1) nejdřív nahrát rozpracované změny – bez toho nic z disku nemažeme
+  sync_once >/dev/null; rc=$?
+  [ $rc -eq 2 ] && die "Server je nedostupný – výběr teď změnit nejde."
+  [ $rc -ne 0 ] && die "Synchronizace hlásí chybu – výběr neměním, aby se nic neztratilo. Detaily: sftpdrive log"
+  # 2) nová pravidla (stará si schováme)
+  cp -f "$RULES" "$RULES.old"
+  if [ "$1" = "--all" ]; then
+    echo "+ /" > "$RULES"
+  else
+    : > "$RULES"
+    for item in "$@"; do printf '+ /%s\n' "$(nfc "${item%/}")" >> "$RULES"; done
+  fi
+  # 3) co už nemá být na disku: ověřit, že je to na serveru celé (jinak nic neměnit)
+  for e in "$OFFLINE_DIR"/* "$OFFLINE_DIR"/.[!.]* "$OFFLINE_DIR"/..?*; do
+    [ -e "$e" ] || continue
+    item=$(nfc "${e##*/}"); is_junk "$item" && continue
+    rel="/$item"
+    is_pinned "$rel" && continue
+    rclone_env || { cp -f "$RULES.old" "$RULES"; die "Chybí heslo v Klíčence."; }
+    if ! rclone check "$e" "$(remote_join "$rel")" --one-way --contimeout 15s \
+          --exclude .DS_Store --exclude "._*" --exclude .localized --exclude ".~lock.*#" --exclude "~\$*" >/dev/null 2>&1; then
+      cp -f "$RULES.old" "$RULES"
+      die "„$item“ není na serveru stejné jako na disku – výběr neměním. Zkus: Synchronizovat teď"
+    fi
+    removed="$removed$e"$'\n'
+  done
+  # 4) smazat z disku (na serveru zůstává) a stáhnout nově vybrané
+  while IFS= read -r line; do [ -n "$line" ] && rm -rf "$line"; done <<EOF
+$removed
+EOF
+  rm -f "$RULES.old"
+  touch "$NEEDS_RESYNC"
+  sync_once >/dev/null
+  lock_release
+  echo "OK"
+}
+
+cmd__ls() { # název → položky v kořeni serveru (složky končí /)
+  load_conn "$1"
+  rclone_env || die "Chybí heslo v Klíčence."
+  rclone lsf "$REMOTE" --max-depth 1 --contimeout 15s --low-level-retries 2 --retries 1 2>&1 || die "Server je nedostupný."
+}
+
+cmd__keyscan() { # host port → otisky klíčů serveru (pro aplikaci)
+  local out
+  out=$(ssh-keyscan -p "$2" -T 10 "$1" 2>/dev/null | grep -v "^#")
+  [ -n "$out" ] || die "Server $1:$2 neodpovídá (špatná adresa/port, firewall?)."
+  printf "%s\n" "$out" | ssh-keygen -lf - | awk "{print \$2 \" \" \$NF}"
+}
+
+cmd__info() { # řádky pro aplikaci v liště (oddělené tabulátorem)
+  local n st t msg mounted agent syncing pending paused
+  for n in $(list_conns); do
+    load_conn "$n"
+    st=""; t=""; msg=""
+    [ -f "$STATE" ] && IFS="|" read -r st t msg < "$STATE"
+    mounted=0; [ "$MOUNT_ENABLED" = 1 ] && is_mounted && mounted=1
+    agent=0; agent_loaded "$LABEL_SYNC" && agent=1
+    syncing=0; [ -d "$LOCK" ] && syncing=1
+    pending=0; [ -f "$CDIR/pending" ] && pending=$(grep -c . "$CDIR/pending")
+    paused=0; [ -f "$CDIR/paused" ] && paused=1
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$NAME" "${PROTO:-sftp}" "$HOST" "$PORT" "$SUSER" "$REMOTE_PATH" "$MOUNT_ENABLED" "$MOUNT_DIR" "$OFFLINE_DIR" "$mounted" "$agent" "$syncing" "$st" "$t" "$msg" "$pending" "$LABEL" "$paused"
+  done
+}
+
+usage() {
+  cat <<EOF
+${C_B}sftpdrive $VERSION${C_OFF} – SFTP / FTP / FTPS server jako složka ve Finderu (oboustranná synchronizace)
+
+  sftpdrive setup                      průvodce novým serverem (adresa, jméno, heslo, název složky)
+  sftpdrive status [připojení]         stav serverů a synchronizace
+  sftpdrive sync [--resync] [připojení]  synchronizovat hned
+  sftpdrive pin <cesta>…               začít synchronizovat složku / soubor
+  sftpdrive unpin <cesta>…             přestat synchronizovat (smaže jen z disku, server nechá)
+  sftpdrive rename připojení "Název"   přejmenovat složku ve Finderu
+  sftpdrive open [připojení]           otevřít složku ve Finderu
+  sftpdrive log [připojení]            sledovat log
+  sftpdrive start|stop [připojení]     spustit / pozastavit synchronizaci
+  sftpdrive password [připojení]       změnit uložené heslo
+  sftpdrive remove [připojení]         odebrat server (data na serveru se nemění)
+  sftpdrive uninstall                  odebrat vše
+
+„připojení“ = interní název serveru (viz sftpdrive status, v závorce).
+Pohodlnější je aplikace SFTP Drive s ikonkou v horní liště.
+EOF
+}
+
+# ----------------------------------------------------------------------------
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  setup|add)   cmd_setup "$@" ;;
+  install)     cmd_install ;;
+  pin)         cmd_pin "$@" ;;
+  unpin)       cmd_unpin "$@" ;;
+  reveal)      cmd_reveal "$@" ;;
+  sync)        cmd_sync "$@" ;;
+  status|list) cmd_status "$@" ;;
+  start)       cmd_start "$@" ;;
+  stop)        cmd_stop "$@" ;;
+  open)        cmd_open "$@" ;;
+  log|logs)    cmd_log "$@" ;;
+  password)    cmd_password "$@" ;;
+  remove)      cmd_remove "$@" ;;
+  uninstall)   cmd_uninstall ;;
+  _daemon)     cmd__daemon "$@" ;;
+  _mount)      cmd__mount "$@" ;;
+  _keyscan)    cmd__keyscan "$@" ;;
+  _ls)         cmd__ls "$@" ;;
+  _select)     cmd__select "$@" ;;
+  rename)      cmd_rename "$@" ;;
+  _info)       cmd__info ;;
+  version|--version) echo "$VERSION" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac
