@@ -30,7 +30,7 @@
 #  Compatible with /bin/bash 3.2 (the default bash on macOS).
 # ============================================================================
 
-VERSION="2.4"
+VERSION="2.5"
 APP_ID="cz.sftpdrive"
 CONF_ROOT="$HOME/.config/sftpdrive"
 LOG_ROOT="$HOME/Library/Logs/sftpdrive"
@@ -408,6 +408,77 @@ clear_pending() {
 # ----------------------------------------------------------------------------
 #  Synchronisation (rclone bisync)
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+#  Helpers for servers that briefly report existing paths as missing
+#  (seen with OpenSSH 8.0: "file does not exist" for a few seconds, even for the
+#  root folder). rclone then tries to create the parent folders itself, the server
+#  refuses ("permission denied") and bisync aborts. See sync_once().
+# ----------------------------------------------------------------------------
+NEEDS_REPAIR_NAME="needs_repair"
+
+# Folders that exist locally but are in none of the last bisync listings are new
+# (folders that ARE listed but missing on the server were deleted on purpose and are
+# never re-created). Create the deepest new ones on the server first, with retries,
+# so uploads into them do not depend on rclone creating parents on a flaky server.
+premake_new_dirs() {
+  local known locald newd rel f i deep other
+  set -- "$WORKDIR"/*.path1.lst "$WORKDIR"/*.path2.lst
+  [ -e "$1" ] || return 0                     # no listings yet (first run) → nothing to compare with
+  known=$(mktemp); locald=$(mktemp); newd=$(mktemp)
+  for f in "$@"; do
+    [ -f "$f" ] && sed -n 's/^d .*"\(.*\)"$/\1/p' "$f"
+  done | sort -u > "$known"
+  (cd "$OFFLINE_DIR" && find . -mindepth 1 -type d 2>/dev/null) | sed 's|^\./||' \
+    | iconv -f UTF-8-MAC -t UTF-8 2>/dev/null | sort -u > "$locald"
+  comm -23 "$locald" "$known" | while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    junk=0
+    IFS='/' read -r -a parts <<EOP
+$rel
+EOP
+    for part in "${parts[@]}"; do is_junk "$part" && junk=1; done
+    [ $junk = 1 ] && continue
+    is_pinned "/$rel" || continue
+    printf '%s\n' "$rel"
+  done > "$newd"
+  # only the deepest new folders – their parents are created on the way
+  while IFS= read -r rel; do
+    deep=1
+    while IFS= read -r other; do
+      case "$other" in "$rel"/*) deep=0; break ;; esac
+    done < "$newd"
+    [ $deep = 1 ] || continue
+    for i in 1 2 3; do
+      if rclone mkdir "$(remote_join "/$rel")" --contimeout 15s --low-level-retries 1 >/dev/null 2>&1; then
+        echo "$(date '+%Y/%m/%d %H:%M:%S') NOTICE: created new folder on the server: $rel" >> "$LOG_SYNC"
+        break
+      fi
+      echo "$(date '+%Y/%m/%d %H:%M:%S') NOTICE: could not create $rel on the server (attempt $i/3)" >> "$LOG_SYNC"
+      [ $i -lt 3 ] && sleep 10
+    done
+  done < "$newd"
+  rm -f "$known" "$locald" "$newd"
+  return 0
+}
+
+# After a critical bisync error, put back the listings of the last successful run
+# (*.lst-good, otherwise bisync's own *.lst-old). Then a normal bisync can simply be
+# repeated – unlike --resync it does not bring back files the user deleted or moved.
+restore_good_listings() { # → 0 when every interrupted session was restored
+  local err sess side src ok=1 any=0
+  for err in "$WORKDIR"/*.path1.lst-err; do
+    [ -f "$err" ] || continue
+    any=1
+    sess="${err%.path1.lst-err}"
+    for side in path1 path2; do
+      src="$sess.$side.lst-good"; [ -f "$src" ] || src="$sess.$side.lst-old"
+      if [ -f "$src" ]; then cp -f "$src" "$sess.$side.lst"; else ok=0; fi
+    done
+    [ $ok = 1 ] && rm -f "$sess.path1.lst-err" "$sess.path2.lst-err" "$sess.path1.lst-new" "$sess.path2.lst-new"
+  done
+  [ $any = 1 ] && [ $ok = 1 ]
+}
+
 sync_once() { # [verbose] → 0 ok, 1 error, 2 server unreachable (the lock must be held)
   local verbose="${1:-}" rc before newlog args=""
   if ! reachable; then
@@ -426,10 +497,22 @@ sync_once() { # [verbose] → 0 ok, 1 error, 2 server unreachable (the lock must
   fi
   mkdir -p "$WORKDIR" "$LOG_ROOT"
   write_filters
+  # After an interruption we could not undo, never merge on our own (a merge brings back
+  # files the user deleted or moved). Only a manual "Sync now" (MANUAL=1) does one resync –
+  # not even a needs_resync set meanwhile (a new local item, changed filters) may bypass this.
+  if [ -f "$CDIR/$NEEDS_REPAIR_NAME" ]; then
+    if [ "${MANUAL:-0}" = 1 ]; then
+      touch "$NEEDS_RESYNC"     # the user asked for it – kept until a resync succeeds
+    else
+      set_state error "Sync stopped to protect your changes – click Sync now to merge both sides"
+      return 1
+    fi
+  fi
   [ -f "$NEEDS_RESYNC" ] && args="--resync --resync-mode newer"
   rotate_log "$LOG_SYNC"
   before=$(stat -f %z "$LOG_SYNC" 2>/dev/null || echo 0)
   rclone_env 2>/dev/null || { set_state error "Password missing in the Keychain – run: sftpdrive password $NAME"; return 1; }
+  [ -z "$args" ] && premake_new_dirs
   # shellcheck disable=SC2086
   rclone bisync "$OFFLINE_DIR" "$REMOTE" $args \
     --filters-file "$FILTERS" \
@@ -437,6 +520,7 @@ sync_once() { # [verbose] → 0 ok, 1 error, 2 server unreachable (the lock must
     --create-empty-src-dirs \
     --compare size,modtime \
     --resilient --recover --max-lock 2m \
+    --retries 3 --retries-sleep 15s \
     --conflict-resolve newer --conflict-loser num --conflict-suffix conflict --suffix-keep-extension \
     --contimeout 15s --timeout 10m \
     --log-file "$LOG_SYNC" --log-level INFO --stats 0
@@ -450,16 +534,35 @@ sync_once() { # [verbose] → 0 ok, 1 error, 2 server unreachable (the lock must
     notify "Conflict in '$NAME'" "A file changed on both sides – the older version was kept as *.conflict1"
   fi
   if [ $rc -eq 0 ]; then
-    rm -f "$NEEDS_RESYNC"
+    rm -f "$NEEDS_RESYNC" "$CDIR/$NEEDS_REPAIR_NAME" "$WORKDIR"/*.lst-err "$WORKDIR"/*.lst-new
+    local f
+    for f in "$WORKDIR"/*.path1.lst "$WORKDIR"/*.path2.lst; do
+      [ -f "$f" ] && cp -f "$f" "$f-good"   # the last known-good state (see restore_good_listings)
+    done
     clear_pending            # tags first, then the sync timestamp
     touch "$CDIR/last_ok"   # time of the last successful sync
     set_state ok "Synced"
     return 0
   fi
-  if printf '%s' "$newlog" | grep -qi "must run --resync"; then
-    touch "$NEEDS_RESYNC"   # next time: safe merge (nothing is deleted)
+  local lasterr
+  lasterr=$(printf '%s\n' "$newlog" | grep -E "ERROR|critical" | tail -n 1 | sed -E 's/^[0-9\/]+ [0-9:]+ //' | cut -c1-160)
+  if printf '%s' "$newlog" | grep -qi "filters file has changed"; then
+    touch "$NEEDS_RESYNC"   # the selection of folders changed – a merge is what the user wants
+  elif printf '%s' "$newlog" | grep -qi "must run --resync"; then
+    if [ -n "$args" ]; then
+      :                     # the resync itself failed – needs_resync stays, it is retried
+    elif restore_good_listings; then
+      echo "$(date '+%Y/%m/%d %H:%M:%S') NOTICE: bisync interrupted by a server error – restored the last good listings, will retry a normal sync (nothing undone)" >> "$LOG_SYNC"
+      set_state error "Interrupted by a server error, nothing was undone – retrying: $lasterr"
+      return 1
+    else
+      touch "$CDIR/$NEEDS_REPAIR_NAME"
+      echo "$(date '+%Y/%m/%d %H:%M:%S') NOTICE: bisync interrupted and no good listings to return to – waiting for a manual sync" >> "$LOG_SYNC"
+      set_state error "Sync stopped to protect your changes – click Sync now to merge both sides"
+      return 1
+    fi
   fi
-  set_state error "$(printf '%s\n' "$newlog" | grep -E "ERROR|critical" | tail -n 1 | sed -E 's/^[0-9\/]+ [0-9:]+ //' | cut -c1-200)"
+  set_state error "$lasterr"
   return 1
 }
 
@@ -586,7 +689,8 @@ cmd_install() { # install the script into ~/.local/bin
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   mkdir -p "$(dirname "$INSTALL_BIN")"
   if [ "$self" != "$INSTALL_BIN" ]; then
-    cp -f "$self" "$INSTALL_BIN"
+    # copy + rename = a new file: running copies of the old script (daemons, "update") keep reading the old one
+    cp -f "$self" "$INSTALL_BIN.new" && mv -f "$INSTALL_BIN.new" "$INSTALL_BIN"
   fi
   chmod +x "$INSTALL_BIN"
   # helpers that sit next to the script inside the app: Finder tags + Finder sidebar
@@ -603,12 +707,16 @@ cmd_install() { # install the script into ~/.local/bin
   # old Quick Actions (replaced by the Finder context menu)
   rm -rf "$SERVICES_DIR/$QA_PIN.workflow" "$SERVICES_DIR/$QA_UNPIN.workflow" "$SERVICES_DIR/$QA_OPEN.workflow"
   /System/Library/CoreServices/pbs -update >/dev/null 2>&1
-  # restart running connections on the new script version
-  local n
+  # restart running connections on the new script version; after an update also rewrite their
+  # background services with the new version's template (settings, passwords and folders stay)
+  local n prev
+  prev=$(cat "$CONF_ROOT/.version" 2>/dev/null)
   for n in $(list_conns); do
     load_conn "$n"
+    [ "$prev" != "$VERSION" ] && [ -f "$AGENT_DIR/$LABEL_SYNC.plist" ] && agents_write
     agent_loaded "$LABEL_SYNC" && launchctl kickstart -k "gui/$(id -u)/$LABEL_SYNC" >/dev/null 2>&1
   done
+  [ -d "$CONF_ROOT" ] && echo "$VERSION" > "$CONF_ROOT/.version"
   case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
     *)
@@ -1059,7 +1167,7 @@ cmd_sync() {
   lock_acquire 600 || die "A synchronisation is already running."
   [ $force = 1 ] && touch "$NEEDS_RESYNC"
   echo "Synchronising '$NAME'…"
-  sync_once verbose
+  MANUAL=1 sync_once verbose
   case $? in
     0) ok "Done." ;;
     2) die "Server $HOST:$PORT is unreachable." ;;
@@ -1176,7 +1284,8 @@ cmd_uninstall() {
   [ -x "$SIDEBAR_BIN" ] && "$SIDEBAR_BIN" remove "$DRIVE_ROOT" 2>/dev/null
   rm -f "$SIDEBAR_BIN"
   release_ramdisk force
-  rm -rf "$LOG_ROOT" "$CACHE_ROOT"
+  rm -rf "$LOG_ROOT" "$CACHE_ROOT" "$CONF_ROOT/.backup"
+  rm -f "$CONF_ROOT/.version"
   rmdir "$CONF_ROOT" 2>/dev/null
   # delete ~/SFTP Drive only when nothing but the folder icon (Icon␍) and .DS_Store is left
   if [ -d "$DRIVE_ROOT" ] && only_junk_in "$DRIVE_ROOT"; then
@@ -1186,6 +1295,133 @@ cmd_uninstall() {
   launchctl bootout "gui/$(id -u)/$APP_ID.menubar" 2>/dev/null
   rm -f "$AGENT_DIR/$APP_ID.menubar.plist"
   ok "SFTP Drive uninstalled (rclone was left in place; remove it with: brew uninstall rclone fswatch)."
+}
+
+# --- updates ------------------------------------------------------------------
+UPDATE_REPO="Mapp25101/MacDrop_SFTP"
+
+ver_gt() { # a b → 0 when version a is newer than version b (2.10 > 2.9)
+  local IFS=. i x y a b
+  read -r -a a <<EOV
+$1
+EOV
+  read -r -a b <<EOV
+$2
+EOV
+  for i in 0 1 2 3; do
+    x=${a[i]:-0}; y=${b[i]:-0}
+    x=${x//[!0-9]/}; y=${y//[!0-9]/}
+    [ "${x:-0}" -gt "${y:-0}" ] && return 0
+    [ "${x:-0}" -lt "${y:-0}" ] && return 1
+  done
+  return 1
+}
+
+latest_version() { # → the newest version released on GitHub (from the "latest release" redirect)
+  local url
+  url=$(curl -fsSIL -o /dev/null -w '%{url_effective}' --max-time 20 \
+    "https://github.com/$UPDATE_REPO/releases/latest" 2>/dev/null) || return 1
+  case "$url" in */tag/*) ;; *) return 1 ;; esac
+  url=${url##*/tag/}
+  printf '%s' "${url#v}"
+}
+
+installed_app() { # → path of the installed "SFTP Drive.app"
+  local a
+  for a in "${SFTPDRIVE_APP:-}" "/Applications/SFTP Drive.app" "$HOME/Applications/SFTP Drive.app"; do
+    [ -n "$a" ] && [ -d "$a/Contents" ] && { printf '%s' "$a"; return 0; }
+  done
+  return 1
+}
+
+# Installs a new version and keeps everything: servers, folders, passwords (Keychain), sync
+# state and launch at login. The settings are backed up to ~/.config/sftpdrive/.backup first.
+# Note: this function must end with exit, never return – the running script file gets replaced.
+cmd_update() { # [--check] [--force] [--from SFTPDrive.zip | SFTP Drive.app]
+  local check=0 force=0 from="" latest tmp newapp newver app n
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --check) check=1 ;;
+      --force) force=1 ;;
+      --from)  from="${2:-}"; [ -n "$from" ] || die "--from needs a file (SFTPDrive.zip or SFTP Drive.app)"; shift ;;
+      *) die "Unknown option: $1 (sftpdrive update [--check] [--force] [--from SFTPDrive.zip])" ;;
+    esac
+    shift
+  done
+  if [ $check = 1 ]; then
+    latest=$(latest_version) || die "Could not reach GitHub – are you online?"
+    if ver_gt "$latest" "$VERSION"; then
+      echo "Update available: $latest (installed $VERSION) – run: sftpdrive update"
+      exit 0
+    fi
+    ok "SFTP Drive $VERSION is up to date."
+    exit 3
+  fi
+
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  if [ -z "$from" ]; then
+    echo "Downloading the latest SFTP Drive from GitHub…"
+    curl -fsSL --max-time 600 "https://github.com/$UPDATE_REPO/releases/latest/download/SFTPDrive.zip" -o "$tmp/update.zip" \
+      || die "Download failed (are you online?)."
+    from="$tmp/update.zip"
+  fi
+  [ -e "$from" ] || die "Not found: $from"
+  case "$from" in
+    *.zip)
+      ditto -x -k "$from" "$tmp/x" 2>/dev/null || die "Could not unpack $from"
+      newapp=$(find "$tmp/x" -maxdepth 3 -type d -name "SFTP Drive.app" | head -n 1) ;;
+    *.app|*.app/) newapp="${from%/}" ;;
+    *) die "Expected SFTPDrive.zip or SFTP Drive.app: $from" ;;
+  esac
+  [ -n "$newapp" ] && [ -f "$newapp/Contents/Resources/sftpdrive" ] \
+    && [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$newapp/Contents/Info.plist" 2>/dev/null)" = "$APP_ID.app" ] \
+    || die "This is not an SFTP Drive package: $from"
+  codesign --verify --deep --strict "$newapp" 2>/dev/null || die "The new app is damaged (signature check failed)."
+  newver=$(/bin/bash "$newapp/Contents/Resources/sftpdrive" version 2>/dev/null)
+  if [ $force = 0 ] && ! ver_gt "$newver" "$VERSION"; then
+    ok "SFTP Drive $VERSION is up to date (the package is ${newver:-unknown}; use --force to reinstall it)."
+    exit 0
+  fi
+  echo "Updating SFTP Drive $VERSION → $newver …"
+  # downloaded copies may carry "quarantine" – macOS would then block the app and its helpers
+  find "$newapp" -exec xattr -d com.apple.quarantine {} + 2>/dev/null
+
+  # 1) back up the settings (servers, folder choice, sync state; passwords stay in the Keychain)
+  if [ -n "$(list_conns)" ]; then
+    rm -rf "$CONF_ROOT/.backup"
+    mkdir -p "$CONF_ROOT/.backup"
+    for n in $(list_conns); do ditto "$CONF_ROOT/$n" "$CONF_ROOT/.backup/$n"; done
+    echo "$VERSION" > "$CONF_ROOT/.backup/VERSION"
+    ok "Settings backed up: $(pretty "$CONF_ROOT/.backup") (version $VERSION)"
+  fi
+
+  # 2) the new engine: script + helpers, background services rewritten and restarted
+  SFTPDRIVE_FROM_APP=1 /bin/bash "$newapp/Contents/Resources/sftpdrive" install </dev/null \
+    || die "Installing the new version failed – the previous settings are in $(pretty "$CONF_ROOT/.backup")."
+
+  # 3) the app itself – replaced in place, so launch at login and the Finder extension keep working
+  if app=$(installed_app); then
+    if [ "$newapp" != "$app" ]; then
+      rm -rf "$app.new" "$app.old"
+      ditto "$newapp" "$app.new" 2>/dev/null || die "Could not write to $(dirname "$app") – drag the new app there by hand."
+      if mv "$app" "$app.old" && mv "$app.new" "$app"; then
+        rm -rf "$app.old"
+      else
+        [ -d "$app" ] || mv "$app.old" "$app" 2>/dev/null
+        rm -rf "$app.new"
+        die "Could not replace $app – drag the new app there by hand."
+      fi
+    fi
+    # a fresh time stamp tells the running menu-bar app that it was replaced → it restarts itself
+    touch "$app/Contents/MacOS/SFTPDrive"
+    pkill -f "SFTPDriveFinder.appex" 2>/dev/null   # Finder starts the new extension on demand
+    ok "App updated: $(pretty "$app")"
+  else
+    echo "  (the SFTP Drive app is not installed – only the command-line tool was updated)"
+  fi
+  ok "SFTP Drive $newver is installed – servers, folders and passwords were kept."
+  exit 0
 }
 
 # --- internal commands used by the LaunchAgents -----------------------------
@@ -1440,6 +1676,8 @@ ${C_B}sftpdrive $VERSION${C_OFF} – SFTP / FTP / FTPS server as a folder in Fin
   sftpdrive start|stop [connection]     start / pause the synchronisation
   sftpdrive password [connection]       change the stored password
   sftpdrive remove [connection]         remove a server (data on the server is untouched)
+  sftpdrive update [--check] [--from SFTPDrive.zip]
+                                        install a new version (keeps servers, settings, passwords)
   sftpdrive uninstall                   remove everything
 
 "connection" = the internal name of a server (see sftpdrive status, in brackets).
@@ -1464,6 +1702,7 @@ case "$cmd" in
   password)    cmd_password "$@" ;;
   remove)      cmd_remove "$@" ;;
   uninstall)   cmd_uninstall ;;
+  update)      cmd_update "$@" ;;
   _daemon)     cmd__daemon "$@" ;;
   _mount)      cmd__mount "$@" ;;
   _keyscan)    cmd__keyscan "$@" ;;

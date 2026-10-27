@@ -16,7 +16,9 @@ INSTALL
 
 The "SFTP Drive" folder is added to the Finder sidebar automatically.
 
-Update: unzip the new version and open it – it replaces the old one.
+Update: menu-bar icon → "Check for updates…". Your servers, folders, settings
+and passwords stay as they are. (Or unzip the new version and open it – it
+replaces the old one.)
 Apple-silicon Macs only (M1 and newer), macOS 13 or newer.
 
 

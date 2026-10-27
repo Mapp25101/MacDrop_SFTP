@@ -26,6 +26,7 @@ let loginPlist = home + "/Library/LaunchAgents/\(loginLabel).plist"
 let toolPath = home + "/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 var bundledScript: String? { Bundle.main.path(forResource: "sftpdrive", ofType: nil) }
+let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
 
 // MARK: - Running the script
 
@@ -51,6 +52,7 @@ func runScript(_ args: [String], stdin: String? = nil, script: String = installe
     var env = ProcessInfo.processInfo.environment
     env["PATH"] = toolPath
     env["SFTPDRIVE_FROM_APP"] = "1"
+    env["SFTPDRIVE_APP"] = Bundle.main.bundlePath   // "update" replaces this copy of the app
     p.environment = env
     let out = Pipe(), inp = Pipe()
     p.standardOutput = out
@@ -705,8 +707,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if self.conns.isEmpty { self.showAdd() }
             }
             self.timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
-                self.restartIfUpdated()
+                if !self.updating { self.restartIfUpdated() }   // during an update the app restarts when it is finished
                 self.refresh()
+                if Date().timeIntervalSince(self.lastUpdateCheck) > 6 * 3600 { self.checkForUpdates(silent: true) }
             }
         }
     }
@@ -822,20 +825,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .contains { fm.isExecutableFile(atPath: $0) }
         if same && hasRclone { done(true); return }
 
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 380, height: 90),
-                            styleMask: [.titled], backing: .buffered, defer: false)
-        panel.title = "SFTP Drive"
-        let sp = NSProgressIndicator(); sp.style = .spinning; sp.startAnimation(nil)
-        let txt = NSTextField(wrappingLabelWithString: hasRclone
+        let panel = progressPanel(hasRclone
             ? "Preparing SFTP Drive…"
             : "Preparing SFTP Drive – downloading rclone (first run only, takes a moment)…")
-        let st = NSStackView(views: [sp, txt])
-        st.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
-        st.spacing = 14
-        panel.contentView = st
-        panel.center()
-        NSApp.activate(ignoringOtherApps: true)
-        panel.makeKeyAndOrderFront(nil)
         runAsync(["install"], script: bundled) { r in
             panel.close()
             if !r.ok {
@@ -843,6 +835,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 NSApp.terminate(nil)
             }
             done(r.ok)
+        }
+    }
+
+    /// A small window with a spinner (installation, update).
+    func progressPanel(_ text: String) -> NSPanel {
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 380, height: 90),
+                            styleMask: [.titled], backing: .buffered, defer: false)
+        panel.title = "SFTP Drive"
+        let sp = NSProgressIndicator(); sp.style = .spinning; sp.startAnimation(nil)
+        let st = NSStackView(views: [sp, NSTextField(wrappingLabelWithString: text)])
+        st.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        st.spacing = 14
+        panel.contentView = st
+        panel.center()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        return panel
+    }
+
+    // --- updates (sftpdrive update – downloads the latest release from GitHub, keeps all settings) ---
+    var updating = false
+    var availableUpdate: String?
+    var lastUpdateCheck = Date.distantPast
+
+    func checkForUpdates(silent: Bool) {
+        lastUpdateCheck = Date()
+        runAsync(["update", "--check"]) { r in
+            if r.ok, let m = r.out.range(of: "available: [0-9][0-9.]*", options: .regularExpression) {
+                self.availableUpdate = String(r.out[m].dropFirst("available: ".count))
+                self.rebuildMenu()
+                if !silent { self.installUpdate() }
+            } else if !silent {
+                if r.code == 3 {
+                    alert("SFTP Drive is up to date", "You have the latest version (\(appVersion)).")
+                } else {
+                    alert("Could not check for updates", r.errorText, style: .warning)
+                }
+            }
+        }
+    }
+
+    @objc func checkUpdatesAction() {
+        if availableUpdate != nil { installUpdate() } else { checkForUpdates(silent: false) }
+    }
+
+    func installUpdate() {
+        guard let v = availableUpdate, !updating else { return }
+        guard alert("Update SFTP Drive to version \(v)?",
+                    "You have version \(appVersion). Your servers, folders, settings and passwords stay as they are – synchronisation only pauses for a moment.",
+                    buttons: ["Update", "Later"]) == 0 else { return }
+        updating = true
+        let panel = progressPanel("Downloading and installing SFTP Drive \(v)…")
+        runAsync(["update"]) { r in
+            panel.close()
+            self.updating = false
+            if r.ok {
+                self.availableUpdate = nil
+                self.restartIfUpdated()   // the app was replaced → start the new version
+                self.refresh()
+            } else {
+                alert("The update failed", r.errorText + "\n\nNothing was lost. You can also download the new version from GitHub and open it.",
+                      style: .warning)
+            }
         }
     }
 
@@ -1011,6 +1066,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add.isEnabled = ready
         menu.addItem(add)
         menu.addItem(mi("How does it work?", #selector(help), symbol: "questionmark.circle"))
+        let upd = availableUpdate.map { mi("Update to version \($0)…", #selector(checkUpdatesAction), symbol: "arrow.down.circle.fill") }
+            ?? mi("Check for updates…", #selector(checkUpdatesAction), symbol: "arrow.down.circle")
+        upd.isEnabled = ready && !updating
+        menu.addItem(upd)
         let login = mi("Launch at login", #selector(toggleLogin))
         login.state = loginEnabled ? .on : .off
         menu.addItem(login)

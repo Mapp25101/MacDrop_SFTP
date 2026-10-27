@@ -47,7 +47,11 @@ Add a server, pick a folder name, done: `SFTP Drive → <name>` appears in Finde
 
 **Requirements:** Apple-silicon Mac (M1 or newer), macOS 13 Ventura or newer.
 
-**Updating:** download the new version, unzip and open it – it replaces the old one automatically.
+**Updating:** menu-bar icon → **Check for updates…** (the app also checks by itself and shows *Update to version …*).
+It downloads the latest release, replaces the app in place and restarts – your servers, folders, settings, passwords
+and the sync state are kept (a backup of the settings goes to `~/.config/sftpdrive/.backup`).
+From Terminal: `sftpdrive update` (or `sftpdrive update --from ~/Downloads/SFTPDrive.zip` for a downloaded ZIP).
+Updating by hand also works: unzip the new version and open it – it replaces the old one.
 
 ## Usage
 
@@ -59,6 +63,7 @@ Add a server, pick a folder name, done: `SFTP Drive → <name>` appears in Finde
 | rename the folder | menu-bar icon → More → **Rename folder…** |
 | sync right now (synced copy) | menu-bar icon → **Sync now** |
 | pause temporarily | menu-bar icon → More → **Pause** |
+| update to the latest version | menu-bar icon → **Check for updates…** (settings are kept) |
 
 In both modes, whatever you delete in the folder is deleted on the server too.
 Safety net for synced copies: if a sync would delete more than half of the files it stops instead.
@@ -75,6 +80,14 @@ including settings and passwords). Data on the servers is never touched.
   For the same reason Finder cannot show per-file status badges (macOS only allows that for signed apps) –
   the status is shown by the menu-bar icon and the *Waiting to upload* tag instead.
 - Online mode needs a working connection; edited files must fit into the RAM buffer (1 GB by default).
+- Some servers briefly report a just-created folder as missing. In online mode, moving files into a new folder
+  may then fail with an I/O error – simply repeat the move. Synced copies create new folders on the server
+  before syncing and retry on their own; if a sync is interrupted anyway, nothing is undone – it just retries.
+  Only when it cannot continue safely does it stop with *Sync stopped to protect your changes* – then click
+  **Sync now** to merge both sides (files deleted or moved since the last good sync may reappear).
+- An interrupted upload can leave a `name.XXXXXXXX.partial` file on the server (and, in a synced copy, on the Mac
+  too). It is safe to delete. It is not filtered out on purpose – changing the filters would force a full
+  re-merge for every existing installation.
 - Finder may store its own `.DS_Store` / `._*` files on the server, as with any network share
   (to stop it: `defaults write com.apple.desktopservices DSDontWriteNetworkStores -bool true`).
 - The folder chooser (synced copy) works on the top-level items of the server.
@@ -138,6 +151,7 @@ The script can be used without the app (after the first launch it lives in `~/.l
 sftpdrive setup            # wizard for a new server
 sftpdrive status           # state of all servers
 sftpdrive sync             # sync right now
+sftpdrive update           # install the latest release from GitHub, keep all settings
 sftpdrive help             # all commands
 ```
 
