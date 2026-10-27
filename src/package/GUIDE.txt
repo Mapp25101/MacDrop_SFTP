@@ -1,5 +1,5 @@
-SFTP DRIVE – an SFTP / FTP / FTPS server as a folder in Finder, like Google Drive
-==================================================================================
+SFTP DRIVE – an SFTP / FTP / FTPS server as a folder in Finder
+===============================================================
 
 INSTALL
 -------
@@ -9,23 +9,30 @@ INSTALL
 3. The app offers to move itself to Applications – confirm.
 4. On first launch it installs the helper tool rclone and opens the
    "Add server" window: protocol (SFTP / FTP / FTPS), address, port,
-   user name, password (stored in the Keychain) and a folder name,
-   e.g. "School".
+   user name, password (stored in the Keychain), a folder name
+   (e.g. "School") and the mode – Online or Synced copy (see below).
 5. Done – a cloud icon appears in the menu bar and everything starts
    automatically from now on.
 
-Tip: select the "SFTP Drive" folder (it lives in your home folder) in Finder
-and press ⌃⌘T – it appears in the sidebar, just like Google Drive.
+The "SFTP Drive" folder is added to the Finder sidebar automatically.
 
 Update: unzip the new version and open it – it replaces the old one.
 Apple-silicon Macs only (M1 and newer), macOS 13 or newer.
 
 
-HOW IT WORKS
-------------
-Inside the "SFTP Drive" folder every server gets a plain folder (e.g.
-"School"). The files live on your disk, so they work offline, and they are
-synchronised both ways:
+TWO MODES
+---------
+Inside the "SFTP Drive" folder every server gets its own folder (e.g.
+"School"). Each server uses one of two modes:
+
+ONLINE (like WinSCP) – the folder is the server itself. You see everything,
+files open straight from the server, edits and dragged-in files are uploaded
+right away. Nothing is stored on this Mac (edited files are kept briefly in
+memory only). Without internet the folder is unavailable – it disconnects
+cleanly and comes back by itself when the server is reachable again.
+
+SYNCED COPY (like Google Drive) – the files live on your disk, so they work
+offline, and they are synchronised both ways:
   • whatever you copy into the folder or edit is uploaded to the server,
   • whatever changes on the server is downloaded automatically,
   • whatever you delete in the folder is deleted on the server too.
@@ -39,7 +46,9 @@ uncheck is removed from the Mac only – it stays on the server.
 
 WHEN THE INTERNET DROPS
 -----------------------
-Keep working as usual. Files that are not on the server yet carry an orange
+Online mode: the folder disconnects (read-only and empty) until the server is
+reachable again – no frozen Finder, no "connection interrupted" dialogs.
+Synced copy: keep working as usual. Files that are not on the server yet carry an orange
 Finder tag "Waiting to upload". As soon as the connection is back they
 upload by themselves within seconds and the tag disappears. No warnings and
 no "eject disk" dialogs.

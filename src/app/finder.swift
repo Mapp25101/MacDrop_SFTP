@@ -89,7 +89,7 @@ final class SFTPDriveFinderSync: FIFinderSync {
         for u in urls {
             let p = nfc(u.path)
             for c in conns {
-                if let r = rel(p, in: c.mountDir) {
+                if !c.offlineDir.isEmpty, let r = rel(p, in: c.mountDir) {   // online-only servers have nothing to sync
                     owner = c; online = true
                     if c.isPinned(r) { canUnpin = true } else { canPin = true }
                 } else if let r = rel(p, in: c.offlineDir) {

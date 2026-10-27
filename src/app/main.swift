@@ -131,6 +131,10 @@ struct Conn {
     let pending: Int          // files waiting to be uploaded
     let label: String         // folder name in Finder
     let paused: Bool          // paused by hand (otherwise it starts by itself after boot)
+    let online: Bool          // online mode: network drive, nothing stored on this Mac (like WinSCP)
+
+    /// The folder the user sees in Finder.
+    var folder: String { online ? mountDir : offlineDir }
 
     init?(line: String) {
         let f = line.components(separatedBy: "\t")
@@ -142,6 +146,7 @@ struct Conn {
         pending = f.count > 15 ? Int(f[15]) ?? 0 : 0
         label = f.count > 16 && !f[16].isEmpty ? f[16] : (offlineDir as NSString).lastPathComponent
         paused = f.count > 17 && f[17] == "1"
+        online = f.count > 18 && f[18] == "online"
     }
 
     var url: String { "\(proto)://\(user)@\(host):\(port)\(remotePath.isEmpty ? "" : remotePath)" }
@@ -156,6 +161,15 @@ struct Conn {
 
     var statusText: String {
         if !running { return paused ? "Paused" : "Starting sync…" }
+        if online {
+            if mounted { return "Connected – online" }
+            switch state {
+            case "ok": return mounted ? "Connected – online" : "Connecting…"
+            case "offline": return "No connection – folder unavailable"
+            case "error": return "Error – folder not connected"
+            default: return "Connecting…"
+            }
+        }
         if syncing { return "Syncing…" }
         let t = time.split(separator: " ").last.map { String($0.prefix(5)) } ?? ""
         switch state {
@@ -168,7 +182,8 @@ struct Conn {
 
     var symbol: String {
         if !running { return paused ? "pause.circle" : "arrow.triangle.2.circlepath" }
-        if syncing { return "arrow.triangle.2.circlepath" }
+        if online && mounted { return "checkmark.circle" }
+        if syncing && !online { return "arrow.triangle.2.circlepath" }
         switch state {
         case "error": return "exclamationmark.triangle"
         case "offline": return "wifi.slash"
@@ -228,6 +243,7 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
     let path = NSTextField()
     let name = NSTextField()
     let syncPopup = NSPopUpButton()
+    let modePopup = NSPopUpButton()
     let certBox = NSButton(checkboxWithTitle: "Do not verify the certificate (self-signed / private CA)", target: nil, action: nil)
     let spinner = NSProgressIndicator()
     let status = NSTextField(labelWithString: "")
@@ -261,6 +277,9 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
         path.placeholderString = "empty = home folder, e.g. /var/www"
         name.placeholderString = "e.g. School"
         syncPopup.addItems(withTitles: ["Whole server (recommended)", "Only selected folders – I will choose after connecting"])
+        modePopup.addItems(withTitles: ["Online – work on the server, nothing stored on this Mac (like WinSCP)",
+                                        "Synced copy – files on this Mac, works offline (like Google Drive)"])
+        modePopup.target = self; modePopup.action = #selector(modeChanged)
         host.target = self; host.action = nil
         NotificationCenter.default.addObserver(self, selector: #selector(hostChanged),
                                                name: NSControl.textDidChangeNotification, object: host)
@@ -286,7 +305,8 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
             [label("SSH key:"), keyRow],
             [label("Server folder:"), path],
             [label("Folder name:"), name],
-            [NSGridCell.emptyContentView, hint("In Finder you get the folder “SFTP Drive → <name>”. It is a plain folder on your disk – it works offline too.")],
+            [NSGridCell.emptyContentView, hint("In Finder you get the folder “SFTP Drive → <name>”, also in the sidebar.")],
+            [label("Mode:"), modePopup],
             [label("Sync:"), syncPopup],
             [NSGridCell.emptyContentView, certBox],
         ])
@@ -315,6 +335,7 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
         intro.widthAnchor.constraint(equalTo: grid.widthAnchor).isActive = true
         window!.contentView = stack
         protoChanged()
+        modeChanged()
         window!.setContentSize(stack.fittingSize)
     }
 
@@ -328,9 +349,13 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
         lastDefaultPort = def
         if protoKey != "sftp" { authPopup.selectItem(at: 0) }
         setRow(4, hidden: protoKey != "sftp")
-        setRow(11, hidden: protoKey != "ftps")
+        setRow(12, hidden: protoKey != "ftps")
         authChanged()
     }
+
+    var online: Bool { modePopup.indexOfSelectedItem == 0 }
+
+    @objc func modeChanged() { setRow(11, hidden: online) }   // "Sync:" only matters for a synced copy
 
     @objc func authChanged() {
         let key = protoKey == "sftp" && authPopup.indexOfSelectedItem == 1
@@ -410,14 +435,18 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
     func runSetup(expectFp: String?) {
         busy(true, "Connecting and setting up… (may take a moment)")
         let n = name.stringValue.trimmingCharacters(in: .whitespaces)
-        let choose = syncPopup.indexOfSelectedItem == 1
+        let choose = !online && syncPopup.indexOfSelectedItem == 1
         var args = ["setup", "--yes", "--proto", protoKey, "--label", n,
                     "--host", host.stringValue.trimmingCharacters(in: .whitespaces),
                     "--port", port.stringValue, "--user", user.stringValue.trimmingCharacters(in: .whitespaces)]
         let p = path.stringValue.trimmingCharacters(in: .whitespaces)
         if !p.isEmpty { args += ["--path", p] }
-        args.append("--no-mount")
-        args.append(choose ? "--choose" : "--all-offline")
+        if online {
+            args.append("--online")
+        } else {
+            args.append("--mirror")
+            args.append(choose ? "--choose" : "--all-offline")
+        }
         if protoKey == "ftps" && certBox.state == .on { args.append("--no-check-cert") }
         if let fp = expectFp { args += ["--expect-fp", fp] }
         let useKey = protoKey == "sftp" && authPopup.indexOfSelectedItem == 1
@@ -429,7 +458,9 @@ final class AddServerWindow: NSWindowController, NSWindowDelegate {
             decorateDriveRoot()
             self.onDone?(n, choose)
             if choose { return }   // the folder chooser opens right away
-            let text = "The server is in Finder as the folder “\(n)” inside SFTP Drive. It is downloading and will keep syncing both ways – it works offline too.\n\nTip: select the “SFTP Drive” folder in Finder and press ⌃⌘T (File → Add to Sidebar)."
+            let text = self.online
+                ? "The server is in Finder as the folder “\(n)” inside SFTP Drive – also in the Finder sidebar.\n\nFiles open straight from the server and your edits are uploaded right away. Nothing is stored on this Mac. Without internet the folder is unavailable."
+                : "The server is in Finder as the folder “\(n)” inside SFTP Drive – also in the Finder sidebar.\n\nIt is downloading and will keep syncing both ways – it works offline too."
             if alert("Connected ✓", text, buttons: ["Open in Finder", "Done"]) == 0 {
                 NSWorkspace.shared.open(URL(fileURLWithPath: driveRoot + "/" + n))
             }
@@ -943,17 +974,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let e = NSMenuItem(title: "   " + String(c.message.prefix(70)), action: nil, keyEquivalent: "")
                 menu.addItem(e)
             }
-            if c.mountEnabled {
+            if c.mountEnabled && !c.online {
                 if c.mounted {
                     menu.addItem(mi("Open the whole server (online)", #selector(openPath(_:)), c.mountDir, symbol: "globe"))
                 } else {
                     menu.addItem(mi("Online folder disconnected – reconnect", #selector(start(_:)), c.name, symbol: "globe"))
                 }
             }
-            menu.addItem(mi("Open folder “\(c.label)”", #selector(openPath(_:)), c.offlineDir, symbol: "folder"))
-            menu.addItem(mi("Sync now", #selector(syncNow(_:)), c.name, symbol: "arrow.triangle.2.circlepath"))
-
-            menu.addItem(mi("Choose synchronised folders…", #selector(chooseFolders(_:)), c.name, symbol: "checklist"))
+            menu.addItem(mi("Open folder “\(c.label)”", #selector(openPath(_:)), c.folder, symbol: "folder"))
+            if !c.online {
+                menu.addItem(mi("Sync now", #selector(syncNow(_:)), c.name, symbol: "arrow.triangle.2.circlepath"))
+                menu.addItem(mi("Choose synchronised folders…", #selector(chooseFolders(_:)), c.name, symbol: "checklist"))
+            }
 
             // more options
             let more = NSMenu()
@@ -1098,17 +1130,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func help() {
         alert("How SFTP Drive works",
               """
-              In Finder there is a folder “SFTP Drive” containing a plain folder for every server (like Google Drive). The files are on your disk, so they work offline too, and they sync both ways.
+              In Finder there is a folder “SFTP Drive” (also in the sidebar) with a folder for every server. Each server uses one of two modes:
 
-              • Whatever you copy into the folder is uploaded to the server.
-              • Whatever you delete there is deleted on the server too.
-              • If a file changes on both sides nothing is lost – the older version is kept as “file.conflict1”.
+              ONLINE (like WinSCP) – the folder is the server itself. You see everything, files open straight from the server and your edits are uploaded right away. Nothing is stored on this Mac (edits are buffered briefly in memory). Without internet the folder is unavailable and comes back by itself.
 
-              Choose which folders are downloaded in the menu → “Choose synchronised folders…” (or right-click in Finder). Whatever you uncheck is removed from the Mac only – it stays on the server.
+              SYNCED COPY (like Google Drive) – the files are on your disk, work offline and sync both ways. Choose which folders are downloaded in the menu → “Choose synchronised folders…”. Files waiting to upload carry an orange Finder tag “Waiting to upload”. If a file changes on both sides nothing is lost – the older version is kept as “file.conflict1”.
 
-              When the internet drops, keep working as usual. Files that are not on the server yet carry an orange Finder tag “Waiting to upload” – once the connection is back they upload by themselves and the tag disappears.
-
-              Tip: select the “SFTP Drive” folder in Finder and press ⌃⌘T – it will be in the sidebar.
+              In both modes: whatever you delete in the folder is deleted on the server too.
 
               Menu-bar icon: ✓ synced · ↻ in progress · ⚠ error · crossed-out cloud = server unreachable.
               """)

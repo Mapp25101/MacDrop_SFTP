@@ -1,10 +1,15 @@
 # MacDrop SFTP — SFTP Drive for macOS
 
-**Your SFTP, FTP or FTPS server as a plain folder in Finder – with two-way sync, like Google Drive.**
+**Your SFTP, FTP or FTPS server as a folder in Finder – work on it directly like in WinSCP, or keep a synced copy like Google Drive.**
 
-Add a server, pick a folder name, done: `SFTP Drive → <name>` appears in Finder, the files from the server are
-downloaded, and everything you copy into the folder or edit there is uploaded automatically. It keeps working
-without internet – changes are caught up as soon as the connection is back.
+Add a server, pick a folder name, done: `SFTP Drive → <name>` appears in Finder and in the sidebar. Choose a mode per server:
+
+| | **Online** (like WinSCP) | **Synced copy** (like Google Drive) |
+|---|---|---|
+| What you see | the whole server, live | the whole server or selected folders |
+| Stored on your Mac | **nothing** – files stream when opened, edits are buffered in memory and uploaded right away | a full copy of the selected folders |
+| Without internet | the folder is unavailable (comes back by itself) | keep working, changes upload later |
+| Good for | big servers, websites, quick edits | working on the go, offline access |
 
 <p align="center">
   <img src="docs/add-server.png" width="49%" alt="Add server window">
@@ -14,10 +19,13 @@ without internet – changes are caught up as soon as the connection is back.
 ## Features
 
 - **SFTP, FTP and FTPS** – log in with a password or an SSH key, as many servers as you like.
-- **A plain folder on your disk** – no network drive, no "eject" prompts, no "connection interrupted" dialogs.
-- **Two-way sync** – changes made on the Mac go to the server, changes on the server are downloaded.
-- **Choose what to keep** – sync the whole server or just selected folders (the rest stays on the server only).
-- **Works offline** – files waiting to be uploaded carry an orange Finder tag *Waiting to upload*.
+- **Two modes** – *Online* (nothing stored on the Mac, like WinSCP) or *Synced copy* (works offline, like Google Drive).
+- **In the Finder sidebar** – the *SFTP Drive* folder is added to Favorites automatically.
+- **Online mode** – open, edit, drag in and delete files straight on the server; edited files live only in a hidden RAM
+  disk until they are uploaded. When the internet drops the folder disconnects cleanly (no frozen Finder, no
+  "connection interrupted" dialogs) and reconnects by itself.
+- **Synced copy** – two-way sync, choose the whole server or selected folders, works offline; files waiting to be
+  uploaded carry an orange Finder tag *Waiting to upload*.
 - **No lost data on conflicts** – if a file changes on both sides the newer one wins and the older one is kept as `file.conflict1.txt`.
 - **Menu-bar icon** with the status (✓ synced / ↻ syncing / ⚠ error / crossed-out = no connection).
 - **Finder context menu** – *Choose synchronised folders…*, *Stop syncing – free up space*.
@@ -35,7 +43,7 @@ without internet – changes are caught up as soon as the connection is back.
      `find ~/Downloads/SFTPDrive -exec xattr -d com.apple.quarantine {} + 2>/dev/null`
 3. The app offers to move itself to **Applications** – confirm.
 4. On first launch it installs [rclone](https://rclone.org) (via Homebrew, or downloaded from rclone.org) and opens the **Add server** window.
-5. Done. Tip: select the **SFTP Drive** folder (in your home folder) in Finder and press **⌃⌘T** to add it to the sidebar.
+5. Done – the **SFTP Drive** folder appears in the Finder sidebar with a folder for each server.
 
 **Requirements:** Apple-silicon Mac (M1 or newer), macOS 13 Ventura or newer.
 
@@ -45,15 +53,15 @@ without internet – changes are caught up as soon as the connection is back.
 
 | I want to… | How |
 |---|---|
-| add another server | menu-bar icon → **Add server…** |
-| choose what is downloaded | menu-bar icon → **Choose synchronised folders…** (or right-click in Finder) |
-| free up disk space | right-click a folder → **Stop syncing – free up space (SFTP)** |
+| add another server | menu-bar icon → **Add server…** (choose *Online* or *Synced copy*) |
+| choose what is downloaded (synced copy) | menu-bar icon → **Choose synchronised folders…** (or right-click in Finder) |
+| free up disk space (synced copy) | right-click a folder → **Stop syncing – free up space (SFTP)** |
 | rename the folder | menu-bar icon → More → **Rename folder…** |
-| sync right now | menu-bar icon → **Sync now** |
+| sync right now (synced copy) | menu-bar icon → **Sync now** |
 | pause temporarily | menu-bar icon → More → **Pause** |
 
-Whatever you delete in the folder is deleted on the server too (just like Google Drive / OneDrive).
-Safety net: if a sync would delete more than half of the files it stops instead.
+In both modes, whatever you delete in the folder is deleted on the server too.
+Safety net for synced copies: if a sync would delete more than half of the files it stops instead.
 
 ## Uninstall
 
@@ -66,8 +74,10 @@ including settings and passwords). Data on the servers is never touched.
 - The app is not signed with an Apple developer certificate → "Open Anyway" is needed on first launch.
   For the same reason Finder cannot show per-file status badges (macOS only allows that for signed apps) –
   the status is shown by the menu-bar icon and the *Waiting to upload* tag instead.
-- The folder chooser works on the top-level items of the server (sub-folders are synced as a whole).
-- The selected content is mirrored to disk – for huge servers choose only some folders.
+- Online mode needs a working connection; edited files must fit into the RAM buffer (1 GB by default).
+- Finder may store its own `.DS_Store` / `._*` files on the server, as with any network share
+  (to stop it: `defaults write com.apple.desktopservices DSDontWriteNetworkStores -bool true`).
+- The folder chooser (synced copy) works on the top-level items of the server.
 - The app's user interface is currently in English only.
 
 ---
@@ -87,18 +97,24 @@ including settings and passwords). Data on the servers is never touched.
 ```
 
 - **`src/sftpdrive`** – the engine (bash, compatible with macOS `/bin/bash` 3.2). For every server it creates a launchd
-  agent `cz.sftpdrive.<connection>.sync` that runs in the background, reacts to file changes (`fswatch`), checks the
-  server every minute and calls `rclone bisync`. Without internet it retries every 10 s.
+  agent `cz.sftpdrive.<connection>.sync`:
+  - *online mode*: a watchdog that keeps an `rclone nfsmount` (a second agent, `….mount`) mounted while the server is
+    reachable – a soft NFS mount hidden from Finder's Locations, write buffer on a hidden RAM disk
+    (`hdiutil attach ram://`), unmounted cleanly when the server goes away;
+  - *synced copy*: reacts to file changes (`fswatch`), checks the server every minute and calls `rclone bisync`;
+    without internet it retries every 10 s.
 - **`src/app/main.swift`** – the menu-bar app (AppKit, no Xcode project). It only calls the script and shows the state.
 - **`src/app/finder.swift`** – the Finder extension (FinderSync) with the context-menu items.
 - **`src/app/tag.swift`** – a tiny helper that sets/removes the *Waiting to upload* tag (keeps other tags intact).
+- **`src/app/sidebar.m`** – adds/removes the *SFTP Drive* folder in the Finder sidebar (Objective-C).
 - **`src/app/make-icon.swift`** – renders the app icon during the build.
 
 ### Where the data lives
 
 | What | Where |
 |---|---|
-| synchronised files | `~/SFTP Drive/<name>/` |
+| server folders | `~/SFTP Drive/<name>/` (online: a mount point; synced copy: the files) |
+| online write buffer | hidden RAM disk mounted on `~/Library/Caches/sftpdrive/ram` |
 | server settings | `~/.config/sftpdrive/<connection>/` (`config`, `rclone.conf`, `offline.list`, `known_hosts`) |
 | passwords | macOS Keychain, service `sftpdrive:<connection>:pass` |
 | logs | `~/Library/Logs/sftpdrive/` (also: menu → More → Show log) |

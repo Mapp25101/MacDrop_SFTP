@@ -9,6 +9,7 @@
 #   Contents/PlugIns/SFTPDriveFinder.appex         Finder menu             (src/app/finder.swift)
 #   Contents/Resources/sftpdrive                   sync engine (bash)      (src/sftpdrive)
 #   Contents/Resources/sftpdrive-tag               Finder tags             (src/app/tag.swift)
+#   Contents/Resources/sftpdrive-sidebar           Finder sidebar entry    (src/app/sidebar.m)
 #   Contents/Resources/AppIcon.icns                icon                    (src/app/make-icon.swift)
 
 cd "$(dirname "$0")" || exit 1
@@ -33,10 +34,12 @@ swiftc -O -parse-as-library -module-name SFTPDriveFinder -application-extension 
   -o "$X/Contents/MacOS/SFTPDriveFinder" "$SRC/app/finder.swift"
 cp "$SRC/app/finder-Info.plist" "$X/Contents/Info.plist"
 
-echo "▸ Script and tag helper…"
+echo "▸ Script and helpers…"
 cp "$SRC/sftpdrive" "$APP/Contents/Resources/sftpdrive"
 chmod +x "$APP/Contents/Resources/sftpdrive"
 swiftc -O -target "$TARGET" -o "$APP/Contents/Resources/sftpdrive-tag" "$SRC/app/tag.swift"
+clang -O2 -fobjc-arc -target "$TARGET" -Wno-deprecated-declarations -framework Foundation -framework CoreServices \
+  -o "$APP/Contents/Resources/sftpdrive-sidebar" "$SRC/app/sidebar.m"
 
 echo "▸ Icon…"
 swiftc -O -o "$BUILD/make-icon" "$SRC/app/make-icon.swift" -framework AppKit
@@ -52,6 +55,7 @@ echo "▸ Signing (ad-hoc)…"
 # Order matters: nested parts first, the extension with its sandbox entitlements,
 # the app last – without --deep, otherwise the extension would lose its entitlements.
 codesign --force -s - "$APP/Contents/Resources/sftpdrive-tag"
+codesign --force -s - "$APP/Contents/Resources/sftpdrive-sidebar"
 codesign --force -s - --entitlements "$SRC/app/finder.entitlements" "$X"
 codesign --force -s - "$APP"
 

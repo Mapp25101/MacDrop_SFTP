@@ -2,12 +2,17 @@
 # ============================================================================
 #  sftpdrive – the synchronisation engine of SFTP Drive (MacDrop SFTP)
 #
-#  A server (SFTP / FTP / FTPS) is mirrored into a plain folder
-#  ~/SFTP Drive/<name> and synchronised in both directions – like Google Drive
-#  in mirror mode.
+#  Every server (SFTP / FTP / FTPS) appears as the folder ~/SFTP Drive/<name>,
+#  in one of two modes:
+#   • online  – the folder IS the server (local NFS mount via rclone nfsmount):
+#               files are streamed when opened, edits are buffered in a hidden
+#               RAM disk and uploaded right away – nothing is stored on the Mac
+#               (like WinSCP). A watchdog unmounts it while the server is
+#               unreachable and remounts it when it is back.
+#   • mirror  – a synced copy on disk, two-way sync – like Google Drive.
 #
 #  How it works:
-#   • rclone bisync      two-way sync between the folder and the server
+#   • rclone bisync      two-way sync between the folder and the server (mirror)
 #   • launchd agent      cz.sftpdrive.<connection>.sync runs in the background
 #                        ("_daemon"), reacts to changes on disk (fswatch) and
 #                        checks the server every minute; retries every 10 s
@@ -25,7 +30,7 @@
 #  Compatible with /bin/bash 3.2 (the default bash on macOS).
 # ============================================================================
 
-VERSION="2.3"
+VERSION="2.4"
 APP_ID="cz.sftpdrive"
 CONF_ROOT="$HOME/.config/sftpdrive"
 LOG_ROOT="$HOME/Library/Logs/sftpdrive"
@@ -135,9 +140,12 @@ load_conn() { # name
   [ -f "$CDIR/config" ] || die "Connection '$NAME' does not exist (sftpdrive list)."
   PROTO=sftp
   LABEL=""
+  MODE=mirror   # mirror = synced copy on disk (like Google Drive); online = nothing stored (like WinSCP)
+  OFFLINE_DIR=""; MOUNT_DIR=""
   # shellcheck disable=SC1090
   . "$CDIR/config"
-  [ -n "$LABEL" ] || LABEL=$(basename "$OFFLINE_DIR")
+  [ -n "$LABEL" ] || LABEL=$(basename "${OFFLINE_DIR:-$MOUNT_DIR}")
+  FOLDER="$OFFLINE_DIR"; [ "$MODE" = online ] && FOLDER="$MOUNT_DIR"
   RCONF="$CDIR/rclone.conf"
   RULES="$CDIR/offline.list"
   FILTERS="$CDIR/filters.txt"
@@ -377,6 +385,7 @@ set_state() { # ok|error|offline message
 #  (no internet or a sync error). Removed after the next successful sync.
 # ----------------------------------------------------------------------------
 TAG_BIN="$HOME/.local/bin/sftpdrive-tag"
+SIDEBAR_BIN="$HOME/.local/bin/sftpdrive-sidebar"
 
 mark_pending() {
   [ -x "$TAG_BIN" ] && [ -f "$CDIR/last_ok" ] && [ -d "$OFFLINE_DIR" ] || return 0
@@ -556,6 +565,8 @@ agents_stop() {
   if [ "$MOUNT_ENABLED" = 1 ]; then
     for i in 1 2 3 4 5 6 7 8 9 10; do is_mounted || break; sleep 0.5; done
     is_mounted && { umount "$MOUNT_DIR" 2>/dev/null || umount -f "$MOUNT_DIR" 2>/dev/null; }
+    # disconnected online folder stays read-only, so nothing is saved there by mistake
+    [ "$MODE" = online ] && ! is_mounted && chmod 555 "$MOUNT_DIR" 2>/dev/null
   fi
   return 0
 }
@@ -578,11 +589,14 @@ cmd_install() { # install the script into ~/.local/bin
     cp -f "$self" "$INSTALL_BIN"
   fi
   chmod +x "$INSTALL_BIN"
-  # tag helper (sits next to the script inside the app)
-  if [ -f "$(dirname "$self")/sftpdrive-tag" ] && [ "$(dirname "$self")/sftpdrive-tag" != "$TAG_BIN" ]; then
-    cp -f "$(dirname "$self")/sftpdrive-tag" "$TAG_BIN" && chmod +x "$TAG_BIN"
-    xattr -d com.apple.quarantine "$TAG_BIN" 2>/dev/null
-  fi
+  # helpers that sit next to the script inside the app: Finder tags + Finder sidebar
+  local h
+  for h in sftpdrive-tag sftpdrive-sidebar; do
+    if [ -f "$(dirname "$self")/$h" ] && [ "$(dirname "$self")/$h" != "$HOME/.local/bin/$h" ]; then
+      cp -f "$(dirname "$self")/$h" "$HOME/.local/bin/$h" && chmod +x "$HOME/.local/bin/$h"
+      xattr -d com.apple.quarantine "$HOME/.local/bin/$h" 2>/dev/null
+    fi
+  done
   # a downloaded file (AirDrop/web) carries "quarantine" → launchd might refuse to run it
   xattr -d com.apple.quarantine "$INSTALL_BIN" 2>/dev/null
   command -v rclone >/dev/null 2>&1 || install_rclone
@@ -608,9 +622,11 @@ cmd_install() { # install the script into ~/.local/bin
 
 cmd_setup() {
   local name="" host="" port="" suser="" rpath="" auth="" keyfile="" pass="" keypass=""
-  local mount_en="" all_off="" cache_gb="" interval="" yes=0 pw_stdin=0 start=1 proto="" nocert=0 expect_fp="" label=""
+  local mount_en="" all_off="" cache_gb="" interval="" yes=0 pw_stdin=0 start=1 proto="" nocert=0 expect_fp="" label="" mode=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --online) mode=online ;;
+      --mirror) mode=mirror ;;
       --proto) proto="$2"; shift ;;
       --label) label="$2"; shift ;;
       --choose) all_off=0 ;;
@@ -789,30 +805,53 @@ EOF
   ok "Login works (items in the folder: $(printf '%s' "$out" | grep -c .))."
 
   # --- options ---
-  # A network drive (online folder) only on request (--mount): when the internet drops,
-  # macOS reports a lost connection and offers to eject it. The default is a plain folder on disk.
-  [ -z "$mount_en" ] && mount_en=0
-  if [ -z "$all_off" ]; then
-    if [ $yes = 1 ]; then all_off=1
+  # Two modes:
+  #   online – the folder is the server itself (network drive); files are streamed when opened,
+  #            edits are buffered in a hidden RAM disk and uploaded right away – nothing is stored
+  #            on this Mac (like WinSCP). Without internet the folder is unavailable.
+  #   mirror – a synced copy on disk (rclone bisync), works offline (like Google Drive).
+  if [ -z "$mode" ]; then
+    if [ $yes = 1 ]; then mode=mirror
     else
       echo
-      if ask_yn "Sync the whole server? (otherwise pick folders later in the app)" y; then all_off=1; else all_off=0; fi
+      echo "Mode:  1) online – browse and edit on the server, nothing stored on this Mac (like WinSCP)"
+      echo "       2) mirror – synced copy on this Mac, works offline (like Google Drive)"
+      ask "Choice" "1"
+      if [ "$REPLY" = 2 ]; then mode=mirror; else mode=online; fi
+    fi
+  fi
+  if [ "$mode" = online ]; then
+    mount_en=1; all_off=0
+  else
+    [ -z "$mount_en" ] && mount_en=0
+    if [ -z "$all_off" ]; then
+      if [ $yes = 1 ]; then all_off=1
+      else
+        echo
+        if ask_yn "Sync the whole server? (otherwise pick folders later in the app)" y; then all_off=1; else all_off=0; fi
+      fi
     fi
   fi
   [ -z "$cache_gb" ] && cache_gb=10
   [ -z "$interval" ] && interval=60
 
-  local mdir="" odir="$DRIVE_ROOT/$label"
-  [ "$mount_en" = 1 ] && mdir="$DRIVE_ROOT/$label (online)"
-  if [ -d "$odir" ] && ! only_junk_in "$odir"; then
+  local mdir="" odir=""
+  if [ "$mode" = online ]; then
+    mdir="$DRIVE_ROOT/$label"
+  else
+    odir="$DRIVE_ROOT/$label"
+    [ "$mount_en" = 1 ] && mdir="$DRIVE_ROOT/$label (online)"
+  fi
+  if [ -d "$DRIVE_ROOT/$label" ] && ! only_junk_in "$DRIVE_ROOT/$label"; then
     rm -rf "$cdir"
-    die "Folder '$(pretty "$odir")' already exists and is not empty – choose another name."
+    die "Folder '$(pretty "$DRIVE_ROOT/$label")' already exists and is not empty – choose another name."
   fi
 
   # --- save ---
   mv -f "$tmpd/rclone.conf" "$cdir/rclone.conf"
   {
     printf 'LABEL=%q\n' "$label"
+    printf 'MODE=%q\n' "$mode"
     printf 'PROTO=%q\n' "$proto"
     printf 'HOST=%q\n' "$host"
     printf 'PORT=%q\n' "$port"
@@ -833,25 +872,34 @@ EOF
   pass=""; keypass=""
   : > "$RULES"
   [ "$all_off" = 1 ] && echo "+ /" > "$RULES"
-  touch "$NEEDS_RESYNC"
-  mkdir -p "$OFFLINE_DIR" "$LOG_ROOT"
+  [ "$MODE" = mirror ] && touch "$NEEDS_RESYNC"
+  mkdir -p "$DRIVE_ROOT" "$LOG_ROOT"
+  [ -n "$OFFLINE_DIR" ] && mkdir -p "$OFFLINE_DIR"
   [ "$mount_en" = 1 ] && mkdir -p "$MOUNT_DIR"
 
   cmd_install >/dev/null
   load_conn "$name"      # cmd_install walks all connections – switch back to the new one
+  # "SFTP Drive" in the Finder sidebar (Favorites)
+  [ -x "$SIDEBAR_BIN" ] && "$SIDEBAR_BIN" add "$DRIVE_ROOT" 2>/dev/null
   if [ $start = 1 ]; then
     agents_start
   fi
 
   echo
-  ok "Done! The server is in Finder as the folder '${C_B}$label${C_OFF}' and syncs in the background."
+  if [ "$MODE" = online ]; then
+    ok "Done! The server is in Finder as the folder '${C_B}$label${C_OFF}' inside 'SFTP Drive' (also in the sidebar)."
+    echo
+    echo "   Folder:  $(pretty "$MOUNT_DIR")"
+    echo "   Online mode: files open straight from the server and edits are uploaded right away."
+    echo "   Nothing is stored on this Mac. Without internet the folder is unavailable."
+  else
+    ok "Done! The server is in Finder as the folder '${C_B}$label${C_OFF}' and syncs in the background."
+    echo
+    echo "   Folder:  $(pretty "$OFFLINE_DIR")"
+    echo "   Whatever you copy into it is uploaded to the server; changes on the server are downloaded automatically."
+    echo "   Works offline too – changes are uploaded once the connection is back."
+  fi
   echo
-  echo "   Folder:  $(pretty "$OFFLINE_DIR")"
-  [ "$mount_en" = 1 ] && echo "   Network drive:  $(pretty "$MOUNT_DIR")"
-  echo "   Whatever you copy into it is uploaded to the server; changes on the server are downloaded automatically."
-  echo "   Works offline too – changes are uploaded once the connection is back."
-  echo
-  echo "   Tip: select the 'SFTP Drive' folder in Finder and press ⌃⌘T to add it to the sidebar."
   echo "   Status: sftpdrive status    Log: sftpdrive log"
   if [ $start = 1 ] && [ $yes != 1 ]; then open "$DRIVE_ROOT" 2>/dev/null; fi
 }
@@ -897,6 +945,7 @@ cmd_pin() {
   [ "$label" = "" ] && label="the whole server"
   for n in $(printf '%s\n' "${conns[@]}" | sort -u); do
     load_conn "$n"
+    [ "$MODE" = online ] && die "'$LABEL' is in online mode – files always stay on the server, there is nothing to keep offline."
     [ "$GUI" = 1 ] && notify "Sync" "Downloading: $label…"
     lock_acquire || die "A synchronisation is in progress, try again in a moment."
     reachable || die "Server $HOST is unreachable – cannot change the setting right now."
@@ -940,6 +989,7 @@ cmd_unpin() {
   [ "$label" = "" ] && label="the whole server"
   for n in $(printf '%s\n' "${conns[@]}" | sort -u); do
     load_conn "$n"
+    [ "$MODE" = online ] && die "'$LABEL' is in online mode – files always stay on the server, there is nothing to keep offline."
     lock_acquire || die "A synchronisation is in progress, try again in a moment."
     # 1) Upload everything first – nothing is deleted without that.
     sync_once >/dev/null
@@ -1005,6 +1055,7 @@ cmd_sync() {
   [ "${1:-}" = "--resync" ] && { force=1; shift; }
   name=$(resolve_name "${1:-}") || exit 1
   load_conn "$name"; need_rclone
+  if [ "$MODE" = online ]; then ok "Online mode – files are read and written directly on the server, nothing to sync."; return 0; fi
   lock_acquire 600 || die "A synchronisation is already running."
   [ $force = 1 ] && touch "$NEEDS_RESYNC"
   echo "Synchronising '$NAME'…"
@@ -1024,21 +1075,27 @@ cmd_status() {
     load_conn "$n"
     echo
     echo "${C_B}● $LABEL${C_OFF} ($NAME)  ${C_DIM}${PROTO:-sftp}://$SUSER@$HOST:$PORT${REMOTE_PATH:+ $REMOTE_PATH}${C_OFF}"
-    if [ "$MOUNT_ENABLED" = 1 ]; then
+    if [ "$MODE" = online ]; then
       if is_mounted; then st="${C_GRN}connected${C_OFF}"; else st="${C_YEL}not connected${C_OFF}"; fi
-      echo "  Online:   $(pretty "$MOUNT_DIR")  – $st"
+      echo "  Folder:   $(pretty "$MOUNT_DIR")  – online, nothing stored on this Mac – $st"
+    else
+      if [ "$MOUNT_ENABLED" = 1 ]; then
+        if is_mounted; then st="${C_GRN}connected${C_OFF}"; else st="${C_YEL}not connected${C_OFF}"; fi
+        echo "  Online:   $(pretty "$MOUNT_DIR")  – $st"
+      fi
+      echo "  Folder:   $(pretty "$OFFLINE_DIR")  – synced copy, $(du -sh "$OFFLINE_DIR" 2>/dev/null | cut -f1 | tr -d ' ') on disk"
     fi
-    echo "  Folder:   $(pretty "$OFFLINE_DIR")  – $(du -sh "$OFFLINE_DIR" 2>/dev/null | cut -f1 | tr -d ' ') on disk"
     if [ -f "$STATE" ]; then
       IFS='|' read -r st t msg < "$STATE"
       case "$st" in
         ok) st="${C_GRN}OK${C_OFF}" ;; offline) st="${C_YEL}offline${C_OFF}" ;; *) st="${C_RED}ERROR${C_OFF}" ;;
       esac
-      echo "  Last sync: $t – $st ${C_DIM}$msg${C_OFF}"
+      echo "  State:    $t – $st ${C_DIM}$msg${C_OFF}"
     fi
     if agent_loaded "$LABEL_SYNC"; then echo "  Background service: ${C_GRN}running${C_OFF}"
     else echo "  Background service: ${C_YEL}stopped${C_OFF} (sftpdrive start $NAME)"; fi
-    if [ -s "$RULES" ]; then
+    if [ "$MODE" = online ]; then :
+    elif [ -s "$RULES" ]; then
       echo "  Synced items:"
       sed -e 's/^+ /    ✔ /' -e 's/^- /    ✖ (excluded) /' "$RULES"
     else
@@ -1064,8 +1121,7 @@ cmd_stop() {  # paused by hand – the app will not restart it on its own
 
 cmd_open() {
   local n; n=$(resolve_name "${1:-}") || exit 1; load_conn "$n"
-  [ "$MOUNT_ENABLED" = 1 ] && open "$MOUNT_DIR"
-  open "$OFFLINE_DIR"
+  open "$FOLDER"
 }
 
 cmd_log() {
@@ -1098,8 +1154,8 @@ cmd_remove() {
   clear_pending
   kc_del pass; kc_del keypass
   rm -rf "$CACHE_DIR"
-  [ "$MOUNT_ENABLED" = 1 ] && rmdir "$MOUNT_DIR" 2>/dev/null
-  if [ -d "$OFFLINE_DIR" ]; then
+  if [ "$MOUNT_ENABLED" = 1 ] && ! is_mounted; then chmod 755 "$MOUNT_DIR" 2>/dev/null; rmdir "$MOUNT_DIR" 2>/dev/null; fi
+  if [ -n "$OFFLINE_DIR" ] && [ -d "$OFFLINE_DIR" ]; then
     if [ $del = 1 ] || { [ -t 0 ] && ask_yn "Also delete the local copy $(pretty "$OFFLINE_DIR")?" n; }; then
       rm -rf "$OFFLINE_DIR"
     else
@@ -1107,6 +1163,7 @@ cmd_remove() {
     fi
   fi
   rm -rf "$CDIR"
+  release_ramdisk     # only if no other online connection is left
   ok "Connection '$n' removed."
 }
 
@@ -1116,6 +1173,9 @@ cmd_uninstall() {
   rm -rf "$SERVICES_DIR/$QA_PIN.workflow" "$SERVICES_DIR/$QA_UNPIN.workflow" "$SERVICES_DIR/$QA_OPEN.workflow"
   rm -f "$INSTALL_BIN"
   rm -f "$TAG_BIN"
+  [ -x "$SIDEBAR_BIN" ] && "$SIDEBAR_BIN" remove "$DRIVE_ROOT" 2>/dev/null
+  rm -f "$SIDEBAR_BIN"
+  release_ramdisk force
   rm -rf "$LOG_ROOT" "$CACHE_ROOT"
   rmdir "$CONF_ROOT" 2>/dev/null
   # delete ~/SFTP Drive only when nothing but the folder icon (Icon␍) and .DS_Store is left
@@ -1134,6 +1194,7 @@ cmd__daemon() {
   need_rclone
   mkdir -p "$LOG_ROOT"
   echo "$(date '+%Y/%m/%d %H:%M:%S') NOTICE: daemon started (interval ${INTERVAL}s)" >> "$LOG_SYNC"
+  [ "$MODE" = online ] && online_watch   # online mode: no syncing, just keep the drive mounted
   while :; do
     if lock_acquire 5; then
       sync_cycle
@@ -1144,39 +1205,117 @@ cmd__daemon() {
   done
 }
 
+# ----------------------------------------------------------------------------
+#  Online mode (network drive, like WinSCP)
+#  rclone serves the server over a local NFS share mounted on ~/SFTP Drive/<name>.
+#  Files are streamed when opened; edited files are buffered in a hidden RAM disk,
+#  uploaded within seconds and then removed – nothing is written to the Mac's disk.
+# ----------------------------------------------------------------------------
+RAM_DIR="$CACHE_ROOT/ram"
+
+ensure_ramdisk() { # → prints the RAM-disk mount point (created on first use, hidden in Finder)
+  local dev sectors
+  if mount | grep -qF " on $RAM_DIR ("; then printf '%s' "$RAM_DIR"; return 0; fi
+  mkdir -p "$RAM_DIR"
+  sectors=$(( ${RAM_MB:-1024} * 2048 ))          # 512-byte sectors; memory is used only as files are written
+  dev=$(hdiutil attach -nomount "ram://$sectors" 2>/dev/null | awk 'NR==1 {print $1}')
+  [ -n "$dev" ] || return 1
+  if newfs_hfs -v "SFTP Drive RAM" "$dev" >/dev/null 2>&1 && mount -t hfs -o nobrowse,nodev,nosuid "$dev" "$RAM_DIR"; then
+    chmod 700 "$RAM_DIR"; printf '%s' "$RAM_DIR"; return 0
+  fi
+  hdiutil detach "$dev" >/dev/null 2>&1
+  return 1
+}
+
+release_ramdisk() { # detach the RAM disk when no online connection needs it any more
+  local n others=0
+  for n in $(list_conns); do
+    [ "$(sed -n 's/^MODE=//p' "$CONF_ROOT/$n/config")" = online ] && others=1
+  done
+  [ "$others" = 1 ] && [ "${1:-}" != force ] && return 0
+  if mount | grep -qF " on $RAM_DIR ("; then
+    local dev; dev=$(mount | grep -F " on $RAM_DIR (" | awk '{print $1}')
+    umount -f "$RAM_DIR" 2>/dev/null; hdiutil detach "$dev" >/dev/null 2>&1
+  fi
+  rmdir "$RAM_DIR" 2>/dev/null
+  return 0
+}
+
+mount_start() { # (re)load the mount agent
+  agents_write
+  agent_loaded "$LABEL_MOUNT" && launchctl bootout "gui/$(id -u)/$LABEL_MOUNT" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u)" "$AGENT_DIR/$LABEL_MOUNT.plist" 2>/dev/null
+}
+
+mount_stop() { # unload the mount agent – rclone unmounts on exit; force it if needed
+  local i
+  agent_loaded "$LABEL_MOUNT" && launchctl bootout "gui/$(id -u)/$LABEL_MOUNT" 2>/dev/null
+  for i in 1 2 3 4 5 6; do is_mounted || break; sleep 0.5; done
+  is_mounted && { umount -f "$MOUNT_DIR" 2>/dev/null || diskutil unmount force "$MOUNT_DIR" >/dev/null 2>&1; }
+  # while disconnected the empty folder is read-only, so nothing gets saved "into the server" by mistake
+  [ -d "$MOUNT_DIR" ] && ! is_mounted && chmod 555 "$MOUNT_DIR" 2>/dev/null
+  return 0
+}
+
+online_watch() { # daemon loop for online mode: mount when the server is reachable, unmount when not
+  while :; do
+    if reachable; then
+      if ! is_mounted; then
+        echo "$(date '+%Y/%m/%d %H:%M:%S') NOTICE: server reachable → mounting" >> "$LOG_MOUNT"
+        mount_start
+        sleep 5
+      fi
+      if is_mounted; then set_state ok "Connected"
+      else set_state error "Could not mount the folder – see: sftpdrive log $NAME"; fi
+      sleep 10
+    else
+      if is_mounted; then
+        echo "$(date '+%Y/%m/%d %H:%M:%S') NOTICE: server unreachable → unmounting" >> "$LOG_MOUNT"
+        mount_stop
+      fi
+      set_state offline "No connection – the folder is back as soon as the server is reachable"
+      sleep 10
+    fi
+  done
+}
+
 cmd__mount() {
   load_conn "$1"
   [ "$MOUNT_ENABLED" = 1 ] || exit 0
   need_rclone
-  mkdir -p "$LOG_ROOT" "$CACHE_DIR"
+  mkdir -p "$LOG_ROOT"
   rotate_log "$LOG_MOUNT"
   # after a crash a "dead" mount may remain → unmount it
   if is_mounted; then
     umount "$MOUNT_DIR" 2>/dev/null || umount -f "$MOUNT_DIR" 2>/dev/null || diskutil unmount force "$MOUNT_DIR" >/dev/null 2>&1
   fi
-  mkdir -p "$MOUNT_DIR"
+  mkdir -p "$MOUNT_DIR"; chmod 755 "$MOUNT_DIR" 2>/dev/null
   if ! only_junk_in "$MOUNT_DIR"; then
-    notify "Online folder '$NAME'" "Folder $(pretty "$MOUNT_DIR") is not empty – move the files out of it."
+    notify "Online folder '$LABEL'" "Folder $(pretty "$MOUNT_DIR") is not empty – move the files out of it."
     echo "$(date '+%Y/%m/%d %H:%M:%S') ERROR: $MOUNT_DIR is not empty" >> "$LOG_MOUNT"
     exit 0
   fi
   if ! reachable; then
+    chmod 555 "$MOUNT_DIR" 2>/dev/null
     echo "$(date '+%Y/%m/%d %H:%M:%S') NOTICE: server unreachable, will retry" >> "$LOG_MOUNT"
     exit 1   # launchd retries in 30 s
   fi
   if ! rclone_env; then
-    notify "Online folder '$NAME'" "Password missing in the Keychain – run: sftpdrive password $NAME"
+    notify "Online folder '$LABEL'" "Password missing in the Keychain – run: sftpdrive password $NAME"
     exit 0
   fi
+  local cache
+  cache=$(ensure_ramdisk) || { cache="$CACHE_DIR"; mkdir -p "$cache"; \
+    echo "$(date '+%Y/%m/%d %H:%M:%S') NOTICE: RAM disk unavailable, using $cache" >> "$LOG_MOUNT"; }
+  # Short timeouts + "soft" mount: without internet Finder gets an error within seconds instead of hanging.
   exec rclone nfsmount "$REMOTE" "$MOUNT_DIR" \
-    --volname "$NAME" \
-    --vfs-cache-mode full \
-    --vfs-cache-max-size "${CACHE_GB:-10}G" \
-    --vfs-cache-max-age 720h \
-    --dir-cache-time 1m \
-    --cache-dir "$CACHE_DIR" \
-    --nfs-cache-type disk \
-    --contimeout 15s \
+    --volname "$LABEL" \
+    --vfs-cache-mode writes \
+    --vfs-cache-max-age 1m --vfs-cache-poll-interval 15s --vfs-write-back 2s \
+    --dir-cache-time 30s \
+    --cache-dir "$cache/$NAME" \
+    --contimeout 5s --timeout 30s --low-level-retries 2 \
+    -o nobrowse -o soft -o intr -o timeo=50 -o retrans=2 \
     --log-file "$LOG_MOUNT" --log-level NOTICE
 }
 
@@ -1185,15 +1324,22 @@ cmd_rename() { # name new_folder_name
   n=$(resolve_name "${1:-}") || exit 1; load_conn "$n"
   new=$(nfc "$(printf "%s" "${2:-}" | sed -e "s/^[[:space:]]*//" -e "s/[[:space:]]*\$//")")
   case "$new" in ""|*/*|.*) die "Invalid folder name." ;; esac
-  newdir="$(dirname "$OFFLINE_DIR")/$new"
-  [ "$newdir" = "$OFFLINE_DIR" ] && return 0
+  newdir="$DRIVE_ROOT/$new"
+  [ "$newdir" = "$FOLDER" ] && return 0
   [ -e "$newdir" ] && die "Folder '$(pretty "$newdir")' already exists."
   lock_acquire 600 || die "A synchronisation is in progress, try again in a moment."
   agents_stop
-  if [ -d "$OFFLINE_DIR" ]; then mv "$OFFLINE_DIR" "$newdir" || die "Renaming failed."; fi
-  conf_set OFFLINE_DIR "$newdir"
+  if [ "$MODE" = online ]; then
+    is_mounted && { lock_release; die "The folder is still in use – close the files in it and try again."; }
+    chmod 755 "$MOUNT_DIR" 2>/dev/null
+    if [ -d "$MOUNT_DIR" ]; then mv "$MOUNT_DIR" "$newdir" || die "Renaming failed."; fi
+    conf_set MOUNT_DIR "$newdir"
+  else
+    if [ -d "$OFFLINE_DIR" ]; then mv "$OFFLINE_DIR" "$newdir" || die "Renaming failed."; fi
+    conf_set OFFLINE_DIR "$newdir"
+    touch "$NEEDS_RESYNC"   # new location → safe merge (nothing is deleted)
+  fi
   conf_set LABEL "$new"
-  touch "$NEEDS_RESYNC"   # new location → safe merge (nothing is deleted)
   lock_release
   load_conn "$n"
   agents_start
@@ -1210,6 +1356,7 @@ conf_set() { # KEY value – rewrite a line in config
 
 cmd__select() { # name --all | item… – which top-level items to sync (the "Choose folders" window)
   load_conn "$1"; shift
+  [ "$MODE" = online ] && die "Online mode shows the whole server – there is nothing to choose."
   [ $# -gt 0 ] || die "Nothing selected."
   lock_acquire 600 || die "A synchronisation is in progress, try again in a moment."
   local rc e item rel removed="" line
@@ -1274,7 +1421,7 @@ cmd__info() { # one line per server for the menu-bar app (tab separated)
     syncing=0; [ -d "$LOCK" ] && syncing=1
     pending=0; [ -f "$CDIR/pending" ] && pending=$(grep -c . "$CDIR/pending")
     paused=0; [ -f "$CDIR/paused" ] && paused=1
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$NAME" "${PROTO:-sftp}" "$HOST" "$PORT" "$SUSER" "$REMOTE_PATH" "$MOUNT_ENABLED" "$MOUNT_DIR" "$OFFLINE_DIR" "$mounted" "$agent" "$syncing" "$st" "$t" "$msg" "$pending" "$LABEL" "$paused"
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$NAME" "${PROTO:-sftp}" "$HOST" "$PORT" "$SUSER" "$REMOTE_PATH" "$MOUNT_ENABLED" "$MOUNT_DIR" "$OFFLINE_DIR" "$mounted" "$agent" "$syncing" "$st" "$t" "$msg" "$pending" "$LABEL" "$paused" "$MODE"
   done
 }
 
@@ -1282,7 +1429,7 @@ usage() {
   cat <<EOF
 ${C_B}sftpdrive $VERSION${C_OFF} – SFTP / FTP / FTPS server as a folder in Finder (two-way sync)
 
-  sftpdrive setup                       wizard for a new server (address, user, password, folder name)
+  sftpdrive setup [--online|--mirror]   wizard for a new server (address, user, password, folder name)
   sftpdrive status [connection]         state of the servers and of the synchronisation
   sftpdrive sync [--resync] [connection]  synchronise right now
   sftpdrive pin <path>…                 start syncing a folder / file
